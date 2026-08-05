@@ -5,7 +5,17 @@ import pytest
 
 import claude_pr_resume_hook as hook
 
-FOOTER = "Resume session: `cd /work/tree; claude -r sess-abc`"
+HEADING = "Resume Claude session by `tester`:"
+FOOTER = f"{HEADING}\n```\ncd /work/tree; claude -r sess-abc\n```"
+
+
+@pytest.fixture(autouse=True)
+def known_user(monkeypatch):
+    monkeypatch.setattr(hook, "local_user", lambda: "tester")
+
+
+def headings_in(body):
+    return [line for line in body.splitlines() if "Resume" in line and "session" in line]
 
 
 def test_gh_pr_create_patches_the_body(run_event, event, api):
@@ -17,7 +27,7 @@ def test_gh_pr_create_patches_the_body(run_event, event, api):
         ("GET", "/repos/owner/repo/pulls/123"),
         ("PATCH", "/repos/owner/repo/pulls/123"),
     ]
-    assert api.patches[0]["body"] == f"Some description.\n\n{FOOTER}\n"
+    assert api.patches[0]["body"] == f"Some description.\n\n---\n\n{FOOTER}\n"
 
 
 def test_gh_pr_edit_also_fires(run_event, event, api):
@@ -35,7 +45,7 @@ def test_url_is_read_from_stdout_not_the_command(run_event, event, api):
 
 
 def test_unchanged_body_skips_the_patch(run_event, event, api):
-    api.body = f"Some description.\n\n{FOOTER}\n"
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
 
     assert run_event(event()) == 0
 
@@ -44,7 +54,7 @@ def test_unchanged_body_skips_the_patch(run_event, event, api):
 
 def test_unchanged_body_skips_the_patch_despite_crlf(run_event, event, api):
     """GitHub serves CRLF bodies; that alone must not count as a change."""
-    api.body = f"Some description.\r\n\r\n{FOOTER}\r\n"
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n".replace("\n", "\r\n")
 
     assert run_event(event()) == 0
 
@@ -52,23 +62,39 @@ def test_unchanged_body_skips_the_patch_despite_crlf(run_event, event, api):
 
 
 def test_stale_footer_is_replaced_not_stacked(run_event, event, api):
+    api.body = (
+        "Some description.\n\n---\n\n"
+        "Resume Claude session by `tester`:\n```\ncd /old; claude -r old-sess\n```\n"
+    )
+
+    run_event(event())
+
+    body = api.patches[0]["body"]
+    assert headings_in(body) == [HEADING]
+    assert "old-sess" not in body
+
+
+def test_footer_from_the_previous_single_line_format_is_migrated(run_event, event, api):
     api.body = "Some description.\n\nResume session: `cd /old; claude -r old-sess`\n"
 
     run_event(event())
 
     body = api.patches[0]["body"]
-    assert body.count("Resume session:") == 1
+    assert body == f"Some description.\n\n---\n\n{FOOTER}\n"
     assert "old-sess" not in body
 
 
 def test_hand_mangled_footer_is_replaced_not_stacked(run_event, event, api):
-    api.body = "Some description.\n\n**Resume session:** cd /old && claude -r old-sess\n"
+    api.body = (
+        "Some description.\n\n"
+        "**Resume session by `tester`:**\n~~~\ncd /old && claude -r old-sess\n~~~\n"
+    )
 
     run_event(event())
 
     body = api.patches[0]["body"]
-    assert body.count("Resume session:") == 1
-    assert body == f"Some description.\n\n{FOOTER}\n"
+    assert headings_in(body) == [HEADING]
+    assert body == f"Some description.\n\n---\n\n{FOOTER}\n"
 
 
 def test_manually_deleted_footer_is_restored(run_event, event, api):
@@ -80,12 +106,15 @@ def test_manually_deleted_footer_is_restored(run_event, event, api):
 
 
 def test_second_session_updates_the_footer_in_place(run_event, event, api):
-    api.body = f"Some description.\n\n{FOOTER}\n"
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
 
     run_event(event(cwd="/other/tree", session_id="sess-xyz"))
 
     body = api.patches[0]["body"]
-    assert body == "Some description.\n\nResume session: `cd /other/tree; claude -r sess-xyz`\n"
+    assert body == (
+        "Some description.\n\n---\n\n"
+        f"{HEADING}\n```\ncd /other/tree; claude -r sess-xyz\n```\n"
+    )
 
 
 @pytest.mark.parametrize(

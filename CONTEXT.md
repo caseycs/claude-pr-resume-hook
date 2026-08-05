@@ -7,8 +7,9 @@ the PR days later.
 ## Language
 
 **Resume footer**:
-The single trailing line in a PR description naming the directory and session
-to return to. A body carries exactly one, always last.
+The trailing block in a PR description naming whose session to return to and
+the command that returns to it: a horizontal rule, a heading, and a fenced
+command. A body carries exactly one, always last.
 _Avoid_: footer line, resume link, signature, trailer
 
 **Session**:

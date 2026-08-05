@@ -5,14 +5,18 @@ runs `gh pr create` or `gh pr edit` in a session, it makes sure the resulting
 PR description ends with a line that lets you jump straight back into that
 session later:
 
-```
-Resume session: `cd ~/github/my-repo; claude -r 85b3ce92-2e7b-432b-bf68-8ca769a1ad8a`
-```
+> ---
+>
+> Resume Claude session by `ilia`:
+> ```
+> cd ~/github/my-repo; claude -r 85b3ce92-2e7b-432b-bf68-8ca769a1ad8a
+> ```
 
 The directory and session id come from the hook event itself, so the footer
 always points at the exact worktree and session that produced — or last
-touched — the PR. Paths under `$HOME` are written tilde-relative, so the
-footer never publishes your username.
+touched — the PR. The name is the local account the session belongs to, so on a
+shared repo you can tell whose session a PR came from. Paths under `$HOME` are
+written tilde-relative.
 
 ## Install
 
@@ -145,17 +149,23 @@ The footer is rewritten to stay correct rather than accumulating:
 | --- | --- |
 | no footer | footer appended |
 | footer deleted by hand | footer appended again |
-| footer from a different session or worktree | replaced in place |
+| footer from a different session, worktree, or user | replaced in place |
 | footer reworded, emphasised, quoted, or moved up the body | replaced with a clean one at the end |
-| blank line before the footer deleted (one newline or both) | spacing restored |
+| rule or fence deleted from the block | replaced with a well-formed one |
+| single-line footer from an earlier version | migrated to the block format |
 | several stacked footers | collapsed to one |
 | footer already correct | body left byte-for-byte alone, no API write |
 
+An unrelated fenced code block or horizontal rule elsewhere in the body is left
+alone; both are pinned by tests.
+
 Directories are rendered `~/…` when under `$HOME`, `~` when they *are* `$HOME`,
 and absolute otherwise. Shell metacharacters get backslash-escaped rather than
-quoted — `cd ~/my\ repo` — so the tilde still expands. CRLF line endings, which
-the GitHub API returns, are normalized before comparison, so an unchanged body
-never produces a spurious write.
+quoted — `cd ~/my\ repo` — so the tilde still expands. The rule is always
+preceded by a blank line, since `text` immediately above `---` is a setext H2 in
+markdown rather than a horizontal rule. CRLF line endings, which the GitHub API
+returns, are normalized before comparison, so an unchanged body never produces a
+spurious write.
 
 ## Requirements
 

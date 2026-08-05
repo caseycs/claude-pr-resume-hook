@@ -7,7 +7,12 @@ session that produced it.
 Reads the Claude Code hook event JSON from stdin, and if it was a `gh pr
 create`/`gh pr edit` Bash call, appends (or replaces) a trailing footer:
 
-    Resume session: `cd ~/path/to/worktree; claude -r <session_id>`
+    ---
+
+    Resume Claude session by `you`:
+    ```
+    cd ~/path/to/worktree; claude -r <session_id>
+    ```
 
 The directory and session come straight from the hook event, so the footer
 always points at the session that produced the PR. Paths under $HOME are
@@ -18,6 +23,7 @@ register or remove the hook in a Claude Code settings file.
 """
 import argparse
 import copy
+import getpass
 import json
 import os
 import re
@@ -30,15 +36,33 @@ from pathlib import Path
 
 GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(create|edit)\b")
 PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
-# Matches any line that looks like a resume footer, wherever it sits in the body
-# and however it has been hand-edited since (moved, reworded past the colon,
-# emphasised, quoted). Deliberately loose - see docs/adr/0003.
-FOOTER_LINE_RE = re.compile(r"^[ \t>]*[*_]{0,2}Resume session:.*$\n?", re.MULTILINE | re.IGNORECASE)
-# The same footer glued onto the end of a line, which is what you get if the
-# blank line separating it from the body is deleted too. Matched only in its
-# exact well-formed shape, so this never swallows prose that mentions it.
+
+# The heading line of a footer, in any of its hand-edited guises. Tolerates the
+# older wording ("Resume session:") so footers written by earlier versions are
+# replaced rather than stacked.
+_HEADING = r"[*_]{0,2}Resume\s+(?:Claude\s+)?session\b[^\n]*"
+_RULE = r"(?:-{3,}|\*{3,}|_{3,})[ \t]*"
+
+# The current footer shape: an optional thematic break, a heading line, and a
+# fenced code block holding the command. Matched wherever it sits in the body.
+# Deliberately loose - see docs/adr/0003.
+FOOTER_BLOCK_RE = re.compile(
+    r"(?:^|\n)\s*"
+    r"(?:" + _RULE + r"\s*)?"
+    r"[ \t>]*" + _HEADING + r"\n[ \t>]*"
+    r"(`{3,}|~{3,})[^\n]*\n"
+    r".*?"
+    r"\n[ \t>]*\1[ \t]*",
+    re.DOTALL | re.IGNORECASE,
+)
+# Any remaining footer heading, on its own line: an older single-line footer, or
+# a block whose fenced command was deleted by hand.
+FOOTER_LINE_RE = re.compile(r"^[ \t>]*" + _HEADING + r"$\n?", re.MULTILINE | re.IGNORECASE)
+# An older single-line footer glued onto the end of a line, which is what you got
+# if the blank line separating it from the body was deleted too. Matched only in
+# its exact well-formed shape, so this never swallows prose that mentions it.
 INLINE_FOOTER_RE = re.compile(
-    r"[ \t]*[*_]{0,2}Resume session:[ \t]*`cd [^`\n]*; claude -r [^`\n]*`[*_]{0,2}",
+    r"[ \t]*[*_]{0,2}Resume\s+(?:Claude\s+)?session[^\n`]*`cd [^`\n]*; claude -r [^`\n]*`[*_]{0,2}",
     re.IGNORECASE,
 )
 # Characters safe to leave bare in a shell word. Everything else gets a
@@ -83,16 +107,32 @@ def normalize(body):
     return (body or "").replace("\r\n", "\n")
 
 
-def footer_for(cwd, session_id):
-    return f"Resume session: `cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}`"
+def local_user():
+    """The local account name, used to say whose session the footer points at."""
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "unknown"
+
+
+def footer_for(cwd, session_id, user=None):
+    command = f"cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}"
+    return f"Resume Claude session by `{user or local_user()}`:\n```\n{command}\n```"
+
+
+def strip_footers(body):
+    """Remove every footer, in any shape this tool has ever written or a human
+    has since edited it into."""
+    without_blocks = FOOTER_BLOCK_RE.sub("\n", body)
+    without_headings = FOOTER_LINE_RE.sub("", without_blocks)
+    return INLINE_FOOTER_RE.sub("", without_headings)
 
 
 def build_body(body, cwd, session_id):
-    without_footer = FOOTER_LINE_RE.sub("", normalize(body))
-    stripped = INLINE_FOOTER_RE.sub("", without_footer).rstrip()
+    stripped = strip_footers(normalize(body)).rstrip()
     footer = footer_for(cwd, session_id)
     if stripped:
-        return f"{stripped}\n\n{footer}\n"
+        return f"{stripped}\n\n---\n\n{footer}\n"
     return f"{footer}\n"
 
 
