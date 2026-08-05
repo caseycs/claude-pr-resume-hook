@@ -1,0 +1,32 @@
+[project]
+name = "claude-pr-resume-hook"
+version = "0.1.0"
+description = "Claude Code PostToolUse hook that appends a resume-session footer to gh PR descriptions"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.8"
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/caseycs/claude-pr-resume-hook"
+
+[project.scripts]
+claude-pr-resume-hook = "claude_pr_resume_hook:main"
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: installs the real tool into a temp uv tool dir (slow)",
+]
+
+[tool.hatch.build.targets.wheel]
+only-include = ["claude_pr_resume_hook.py"]
+sources = ["."]
