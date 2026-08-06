@@ -35,6 +35,18 @@ when that variable isn't set. Restart Claude Code afterwards.
 Upgrade with `uv tool upgrade claude-pr-resume-hook`. If the shim ever moves,
 re-run `claude-pr-resume-hook install` to repoint the settings at it.
 
+To pin a release rather than track `main`:
+
+```bash
+uv tool install git+https://github.com/caseycs/claude-pr-resume-hook@v0.1.0
+```
+
+Releases are cut by [release-please](.github/workflows/release.yml): merging the
+release PR it maintains tags that commit, publishes the GitHub Release, and
+attaches the sdist and wheel. Version bumps come from
+[conventional commits](https://www.conventionalcommits.org) — `feat:` and `fix:`
+subjects are what move the version and appear in the changelog.
+
 ### install and uninstall
 
 `install` is a reconciler, not an appender. It adds what's missing, rewrites
