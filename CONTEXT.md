@@ -33,6 +33,12 @@ The executable `uv tool install` places in uv's bin directory. What the
 settings entries name, by absolute path.
 _Avoid_: binary, wrapper, entry point
 
+**Hook target**:
+One tool event the hook should fire on, as a matcher plus an optional filter —
+`gh pr create`, `gh pr edit`, or the GitHub MCP server's PR write tools. What
+`install` reconciles into settings, one entry per target.
+_Avoid_: trigger, rule, binding
+
 **Reconcile**:
 Bringing a settings file to the desired state by comparing what is there with
 what should be: adding, rewriting, or removing entries as needed, and writing

@@ -44,17 +44,18 @@ already match:
 
 ```
 $ claude-pr-resume-hook install
-uv tool ............ found  /Users/you/.local/bin/claude-pr-resume-hook
-settings ........... /Users/you/.claude/settings.json
-  gh pr create ..... up to date
-  gh pr edit ....... stale path, updating
+uv tool ...................... found  /Users/you/.local/bin/claude-pr-resume-hook
+settings ..................... /Users/you/.claude/settings.json
+  gh pr create ............... up to date
+  gh pr edit ................. stale path, updating
                        was  python3 /old/checkout/append_resume_footer.py
                        now  /Users/you/.local/bin/claude-pr-resume-hook
-backup ............. settings.json.bak
-result ............. updated - restart Claude Code
+  github mcp pull requests ... adding
+backup ....................... settings.json.bak
+result ....................... updated - restart Claude Code
 
 $ claude-pr-resume-hook install
-result ............. already up to date, nothing written
+result ....................... already up to date, nothing written
 ```
 
 `uninstall` is the mirror image: it removes this tool's entries from the
@@ -115,11 +116,13 @@ up first.
 
 The hook reads the Claude Code hook event JSON from stdin:
 
-1. Ignores anything that isn't a `Bash` call running `gh pr create` or
-   `gh pr edit`.
-2. Extracts the PR's `owner/repo/number` from the PR URL that `gh` prints to
-   stdout on success. If `gh` didn't print a URL — the command failed, or was
-   `--web` — it does nothing.
+1. Ignores anything that isn't one of the two routes a PR can be opened by:
+   a `Bash` call running `gh pr create`/`gh pr edit`, or the GitHub MCP server's
+   `create_pull_request`/`update_pull_request`.
+2. Extracts the PR's `owner/repo/number` from the PR URL — printed to stdout by
+   `gh`, or returned in the MCP tool's JSON result. If there's no URL — the
+   command failed, `gh pr create --web` was used, or the MCP tool only asked for
+   confirmation — it does nothing.
 3. Fetches the current PR body and takes the session's `cwd`/`session_id`
    from the hook event, authenticating to the GitHub REST API with a token
    from `$GH_TOKEN`/`$GITHUB_TOKEN`, falling back to `gh auth token`.
@@ -135,6 +138,25 @@ The `if` filters keep Claude Code from spawning the hook for most Bash calls,
 but they are an optimisation rather than a guarantee: `if` matching **fails
 open**, so when Claude Code cannot parse a compound command the hook runs
 anyway. Correctness comes from the hook re-checking the command itself.
+
+### The GitHub MCP server
+
+`install` writes a second matcher group for the MCP route:
+
+```json
+{
+  "matcher": "mcp__github__(create_pull_request|update_pull_request)",
+  "hooks": [{ "type": "command", "command": "/path/to/claude-pr-resume-hook" }]
+}
+```
+
+The matcher needs no `if` filter — it already names the exact two tools. It does,
+however, **assume your GitHub MCP server is keyed `github`**, which is the
+default but is yours to choose. If yours differs, or it comes from a plugin (those
+appear as `mcp__plugin_<plugin>_<server>__…`), edit that matcher by hand; the hook
+itself recognises PR tools on any server, so no code change is needed. Note that a
+bare `mcp__github` matches *nothing* — Claude Code compares metacharacter-free
+matchers as exact strings, so the parenthesised group or a `.*` suffix is required.
 
 See [`docs/adr/`](./docs/adr) for why the hook talks to the REST API directly
 instead of using `gh pr edit`, why settings name the shim by absolute path,
