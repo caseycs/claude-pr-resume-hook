@@ -37,9 +37,12 @@ re-run `claude-pr-resume-hook install` to repoint the settings at it.
 
 To pin a release rather than track `main`:
 
+<!-- x-release-please-start-version -->
 ```bash
 uv tool install git+https://github.com/caseycs/claude-pr-resume-hook@v0.1.0
 ```
+<!-- x-release-please-end -->
+
 
 Releases are cut by [release-please](.github/workflows/release.yml): merging the
 release PR it maintains tags that commit, publishes the GitHub Release, and
