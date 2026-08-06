@@ -1,0 +1,13 @@
+# Changelog
+
+## 0.1.0 (2026-08-06)
+
+
+### Features
+
+* fire the hook on the GitHub MCP server's pull request tools ([#1](https://github.com/caseycs/claude-pr-resume-hook/issues/1)) ([0d43863](https://github.com/caseycs/claude-pr-resume-hook/commit/0d438632541ea606c72d644906c8ecad44436991))
+
+
+### Miscellaneous Chores
+
+* seed the release manifest at 0.0.0 ([36c887a](https://github.com/caseycs/claude-pr-resume-hook/commit/36c887a82bce426aff85a2ed26ef05b75c46dc16))
