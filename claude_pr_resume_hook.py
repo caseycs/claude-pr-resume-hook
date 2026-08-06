@@ -76,6 +76,22 @@ TOOL_SOURCE = "git+https://github.com/caseycs/claude-pr-resume-hook"
 # `if` is an optimisation, not a guarantee: it fails open when Claude Code
 # cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE.
 MATCHED_COMMANDS = ("gh pr create", "gh pr edit")
+# The GitHub MCP server's PR-writing tools. `install` pins the server key, since
+# it cannot know how yours is configured; the regex below stays tolerant so a
+# hand-widened matcher (a renamed server, or a plugin-bundled one named
+# `mcp__plugin_<plugin>_<server>__…`) still works.
+MCP_SERVER = "github"
+MCP_PR_TOOLS = ("create_pull_request", "update_pull_request")
+MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_PR_TOOLS))
+MCP_PR_TOOL_RE = re.compile(r"^mcp__.+__(?:create|update)_pull_request$")
+
+# Every settings entry install maintains: which tool event to match, how to
+# narrow it, and what to call it when reporting.
+HOOK_TARGETS = (
+    {"matcher": "Bash", "if": "Bash(gh pr create*)", "label": "gh pr create"},
+    {"matcher": "Bash", "if": "Bash(gh pr edit*)", "label": "gh pr edit"},
+    {"matcher": MCP_MATCHER, "if": None, "label": "github mcp pull requests"},
+)
 # A hook entry whose command mentions any of these belongs to us, and is
 # reconciled on install rather than duplicated.
 OURS_MARKERS = ("claude-pr-resume-hook", "claude_pr_resume_hook", "append_resume_footer")
@@ -172,22 +188,65 @@ def api_request(method, path, token, payload=None):
         return json.load(resp)
 
 
+def pr_from_bash(event):
+    """(owner, repo, number) for a `gh pr create`/`gh pr edit` call, or None."""
+    command = event.get("tool_input", {}).get("command", "")
+    if not GH_PR_COMMAND_RE.search(command):
+        return None
+    response = event.get("tool_response")
+    stdout = response.get("stdout") if isinstance(response, dict) else None
+    match = PR_URL_RE.search(stdout or "")
+    # No URL means gh printed none - the command failed, or was `--web`.
+    return match.groups() if match else None
+
+
+def pr_from_mcp(event):
+    """(owner, repo, number) for a GitHub MCP PR create/update call, or None."""
+    # The server returns a text result holding JSON like
+    # {"id": "...", "url": "https://github.com/owner/repo/pull/1"}. Serialize the
+    # whole response rather than reaching into it: how Claude Code nests MCP
+    # content is undocumented, and this works for a text block, a list of blocks,
+    # a bare string or a dict alike. Note `id` is GitHub's database id, not the
+    # PR number, so the URL is the only usable source.
+    try:
+        blob = json.dumps(event.get("tool_response"))
+    except (TypeError, ValueError):
+        blob = ""
+    match = PR_URL_RE.search(blob)
+    if match:
+        return match.groups()
+
+    # update_pull_request names its target in the input, so fall back to those
+    # fields if a future server version stops returning the URL. Read them by
+    # name only - never regex tool_input, because a PR body legitimately contains
+    # other PRs' URLs ("closes .../pull/5") and we would patch the wrong one.
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return None
+    owner, repo, number = (
+        tool_input.get("owner"),
+        tool_input.get("repo"),
+        tool_input.get("pullNumber"),
+    )
+    if not owner or not repo or not isinstance(number, (int, float)):
+        return None
+    return str(owner), str(repo), str(int(number))
+
+
 def run_hook():
     event = json.load(sys.stdin)
 
-    if event.get("tool_name") != "Bash":
+    tool_name = event.get("tool_name") or ""
+    if tool_name == "Bash":
+        target = pr_from_bash(event)
+    elif MCP_PR_TOOL_RE.match(tool_name):
+        target = pr_from_mcp(event)
+    else:
         return 0
 
-    command = event.get("tool_input", {}).get("command", "")
-    if not GH_PR_COMMAND_RE.search(command):
+    if not target:
         return 0
-
-    stdout = event.get("tool_response", {}).get("stdout") or ""
-    match = PR_URL_RE.search(stdout)
-    if not match:
-        # gh didn't print a PR URL (e.g. the command failed) - nothing to do.
-        return 0
-    owner, repo, number = match.group(1), match.group(2), match.group(3)
+    owner, repo, number = target
 
     cwd = event.get("cwd")
     session_id = event.get("session_id")
@@ -280,13 +339,17 @@ def is_ours(entry):
 
 
 def take_our_entries(groups):
-    """Remove and return every entry of ours, pruning groups left empty."""
+    """Remove every entry of ours, pruning groups left empty.
+
+    Returns (matcher, entry) pairs - the matcher matters now that entries live in
+    more than one group, and is lost once the entry is detached.
+    """
     taken = []
     for group in groups:
         if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
             continue
         kept = [h for h in group["hooks"] if not is_ours(h)]
-        taken.extend(h for h in group["hooks"] if is_ours(h))
+        taken.extend((group.get("matcher"), h) for h in group["hooks"] if is_ours(h))
         group["hooks"] = kept
     groups[:] = [g for g in groups if not isinstance(g, dict) or g.get("hooks")]
     return taken
@@ -304,28 +367,44 @@ def prune_empty(settings):
 
 
 def desired_entries(command):
-    return [
-        {"type": "command", "if": f"Bash({c}*)", "command": command}
-        for c in MATCHED_COMMANDS
-    ]
+    """(matcher, entry) pairs for every hook target."""
+    pairs = []
+    for target in HOOK_TARGETS:
+        entry = {"type": "command"}
+        if target["if"]:
+            entry["if"] = target["if"]
+        entry["command"] = command
+        pairs.append((target["matcher"], entry))
+    return pairs
 
 
-def add_entries(groups, entries):
-    """Append to the existing Bash matcher group, or create one."""
-    for group in groups:
-        if (
-            isinstance(group, dict)
-            and group.get("matcher") == "Bash"
-            and isinstance(group.get("hooks"), list)
-        ):
-            group["hooks"].extend(entries)
-            return
-    groups.append({"matcher": "Bash", "hooks": entries})
+def target_label(matcher, filter_):
+    for target in HOOK_TARGETS:
+        if target["matcher"] == matcher and target["if"] == filter_:
+            return target["label"]
+    return None
+
+
+def add_entries(groups, pairs):
+    """Add each entry under its matcher, joining an existing group when there is one."""
+    for matcher, entry in pairs:
+        for group in groups:
+            if (
+                isinstance(group, dict)
+                and group.get("matcher") == matcher
+                and isinstance(group.get("hooks"), list)
+            ):
+                group["hooks"].append(entry)
+                break
+        else:
+            groups.append({"matcher": matcher, "hooks": [entry]})
 
 
 # --- verbose reporting -------------------------------------------------------
 
-_LABEL_WIDTH = 20
+# Wide enough that the longest label ("  github mcp pull requests ") still gets
+# its three dots, so every line's value starts in the same column.
+_LABEL_WIDTH = 30
 
 
 def report(label, value, indent=0):
@@ -384,23 +463,26 @@ def cmd_install(args):
 
     groups = post_tool_use_groups(settings, create=True)
     existing = take_our_entries(groups)
-    by_filter = {e.get("if"): e for e in existing if isinstance(e, dict)}
+    by_key = {
+        (matcher, entry.get("if")): entry
+        for matcher, entry in existing
+        if isinstance(entry, dict)
+    }
 
-    for entry in desired_entries(shim):
-        pattern = entry["if"]
-        label = pattern[len("Bash(") : -len("*)")]
-        previous = by_filter.pop(pattern, None)
+    for target in HOOK_TARGETS:
+        key = (target["matcher"], target["if"])
+        previous = by_key.pop(key, None)
         if previous is None:
-            report(label, "adding", indent=1)
+            report(target["label"], "adding", indent=1)
         elif previous.get("command") == shim:
-            report(label, "up to date", indent=1)
+            report(target["label"], "up to date", indent=1)
         else:
-            report(label, "stale path, updating", indent=1)
+            report(target["label"], "stale path, updating", indent=1)
             detail("was", previous.get("command"))
             detail("now", shim)
 
-    if by_filter:
-        report("legacy entries", f"{len(by_filter)} removed", indent=1)
+    if by_key:
+        report("legacy entries", f"{len(by_key)} removed", indent=1)
 
     add_entries(groups, desired_entries(shim))
     prune_empty(settings)
@@ -432,9 +514,12 @@ def cmd_uninstall(args):
     groups = post_tool_use_groups(settings)
     before_groups = len(groups)
     removed = take_our_entries(groups)
-    for entry in removed:
-        pattern = entry.get("if") or ""
-        label = pattern[len("Bash(") : -len("*)")] if pattern.startswith("Bash(") else "entry"
+    for matcher, entry in removed:
+        filter_ = entry.get("if") if isinstance(entry, dict) else None
+        label = target_label(matcher, filter_)
+        if label is None:
+            # An entry from an older install, or a hand-edited one.
+            label = filter_[len("Bash(") : -len("*)")] if (filter_ or "").startswith("Bash(") else "entry"
         report(label, "removed", indent=1)
     dropped = before_groups - len(groups)
     if dropped:

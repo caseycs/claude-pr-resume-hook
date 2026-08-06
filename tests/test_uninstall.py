@@ -98,6 +98,33 @@ def test_sibling_entries_in_our_bash_group_survive(home, shim, monkeypatch):
     assert groups == [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo other"}]}]
 
 
+def test_removes_the_mcp_group_too(home, shim, monkeypatch, capsys):
+    install(monkeypatch)
+    groups = read(home / ".claude/settings.json")["hooks"]["PostToolUse"]
+    assert [g["matcher"] for g in groups] == ["Bash", hook.MCP_MATCHER]
+    capsys.readouterr()
+
+    uninstall(monkeypatch)
+
+    out = capsys.readouterr().out
+    assert "github mcp pull requests" in out
+    assert read(home / ".claude/settings.json") == {}
+
+
+def test_an_unrelated_mcp_group_survives(home, shim, monkeypatch):
+    path = home / ".claude/settings.json"
+    seed(path, {"hooks": {"PostToolUse": [
+        {"matcher": "mcp__memory__.*", "hooks": [{"type": "command", "command": "echo mem"}]}
+    ]}})
+    install(monkeypatch)
+
+    uninstall(monkeypatch)
+
+    assert read(path)["hooks"]["PostToolUse"] == [
+        {"matcher": "mcp__memory__.*", "hooks": [{"type": "command", "command": "echo mem"}]}
+    ]
+
+
 def test_removes_a_legacy_installation(home, shim, monkeypatch):
     """Uninstall must clean up entries this version never wrote."""
     path = home / ".claude/settings.json"

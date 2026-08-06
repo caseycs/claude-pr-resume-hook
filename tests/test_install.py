@@ -36,7 +36,7 @@ def test_writes_the_absolute_resolved_shim_path(home, shim, monkeypatch):
     assert install(monkeypatch) == 0
 
     entries = our_entries(read(home / ".claude/settings.json"))
-    assert [e["command"] for e in entries] == [shim, shim]
+    assert [e["command"] for e in entries] == [shim, shim, shim]
     assert entries[0]["command"].startswith("/")
 
 
@@ -78,11 +78,18 @@ def test_does_not_mention_uv_when_uv_is_present(home, monkeypatch, tmp_path):
 def test_creates_user_settings_from_scratch(home, shim, monkeypatch):
     install(monkeypatch)
 
-    settings = read(home / ".claude/settings.json")
-    group = settings["hooks"]["PostToolUse"][0]
-    assert group["matcher"] == "Bash"
-    assert [e["if"] for e in group["hooks"]] == ["Bash(gh pr create*)", "Bash(gh pr edit*)"]
-    assert all(e["type"] == "command" for e in group["hooks"])
+    groups = read(home / ".claude/settings.json")["hooks"]["PostToolUse"]
+
+    bash, mcp = groups
+    assert bash["matcher"] == "Bash"
+    assert [e["if"] for e in bash["hooks"]] == ["Bash(gh pr create*)", "Bash(gh pr edit*)"]
+
+    # The MCP tools are narrowed by matcher, so they need no `if` filter.
+    assert mcp["matcher"] == "mcp__github__(create_pull_request|update_pull_request)"
+    assert len(mcp["hooks"]) == 1
+    assert "if" not in mcp["hooks"][0]
+
+    assert all(e["type"] == "command" for g in groups for e in g["hooks"])
 
 
 @pytest.mark.parametrize(
@@ -97,7 +104,7 @@ def test_each_scope_writes_its_own_file(home, shim, monkeypatch, tmp_path, scope
     install(monkeypatch, "--scope", scope)
 
     expected = home / ".claude/settings.json" if relative is None else tmp_path / "project" / relative
-    assert len(our_entries(read(expected))) == 2
+    assert len(our_entries(read(expected))) == 3
 
 
 def test_unknown_scope_is_rejected(home, shim, monkeypatch):
@@ -114,7 +121,7 @@ def test_user_scope_honors_claude_config_dir(home, shim, monkeypatch, tmp_path):
 
     install(monkeypatch)
 
-    assert len(our_entries(read(config_dir / "settings.json"))) == 2
+    assert len(our_entries(read(config_dir / "settings.json"))) == 3
     assert not (home / ".claude" / "settings.json").exists()
 
 
@@ -193,7 +200,7 @@ def test_updates_a_stale_path_and_reports_the_change(home, shim, monkeypatch, ca
     assert old in out
     assert shim in out
     entries = our_entries(read(path))
-    assert [e["command"] for e in entries] == [shim, shim]
+    assert [e["command"] for e in entries] == [shim, shim, shim]
 
 
 def test_removes_legacy_entries_that_do_not_match_our_filters(home, shim, monkeypatch, capsys):
@@ -208,7 +215,7 @@ def test_removes_legacy_entries_that_do_not_match_our_filters(home, shim, monkey
 
     assert "2 removed" in capsys.readouterr().out
     entries = our_entries(read(path))
-    assert len(entries) == 2
+    assert len(entries) == 3
     assert all(e["command"] == shim for e in entries)
 
 
@@ -219,7 +226,7 @@ def test_installing_twice_does_not_duplicate(home, shim, monkeypatch):
 
     second = read(home / ".claude/settings.json")
     assert first == second
-    assert len(our_entries(second)) == 2
+    assert len(our_entries(second)) == 3
 
 
 def test_reinstall_after_the_shim_moves_rewrites_the_path(home, shim, monkeypatch, tmp_path):
@@ -235,7 +242,7 @@ def test_reinstall_after_the_shim_moves_rewrites_the_path(home, shim, monkeypatc
     install(monkeypatch)
 
     entries = our_entries(read(home / ".claude/settings.json"))
-    assert [e["command"] for e in entries] == [str(exe.resolve())] * 2
+    assert [e["command"] for e in entries] == [str(exe.resolve())] * 3
 
 
 # --- merging into existing settings ------------------------------------------
@@ -260,7 +267,7 @@ def test_unrelated_settings_are_preserved(home, shim, monkeypatch):
     assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "echo pre"
     write_group = next(g for g in settings["hooks"]["PostToolUse"] if g["matcher"] == "Write")
     assert write_group["hooks"][0]["command"] == "echo fmt"
-    assert len(our_entries(settings)) == 2
+    assert len(our_entries(settings)) == 3
 
 
 def test_joins_an_existing_bash_matcher_group(home, shim, monkeypatch):
@@ -272,9 +279,10 @@ def test_joins_an_existing_bash_matcher_group(home, shim, monkeypatch):
     install(monkeypatch)
 
     groups = read(path)["hooks"]["PostToolUse"]
-    assert len(groups) == 1
+    assert [g["matcher"] for g in groups] == ["Bash", hook.MCP_MATCHER]
     assert groups[0]["hooks"][0]["command"] == "echo other"
     assert len(groups[0]["hooks"]) == 3
+    assert len(groups[1]["hooks"]) == 1
 
 
 def test_emptied_matcher_group_is_dropped(home, shim, monkeypatch):
@@ -287,7 +295,9 @@ def test_emptied_matcher_group_is_dropped(home, shim, monkeypatch):
     install(monkeypatch)
 
     groups = read(path)["hooks"]["PostToolUse"]
-    assert [g["matcher"] for g in groups] == ["Bash"]
+    # The Write group held only our stale entry, so it goes; Bash survives for its
+    # sibling, and the MCP group is added.
+    assert [g["matcher"] for g in groups] == ["Bash", hook.MCP_MATCHER]
 
 
 # --- safety ------------------------------------------------------------------
