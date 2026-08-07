@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/caseycs/claude-pr-resume-hook/compare/claude-pr-resume-hook-v0.1.0...claude-pr-resume-hook-v0.2.0) (2026-08-07)
+
+
+### Features
+
+* keep one collapsed footer per user, keyed on the GitHub login ([c26ef14](https://github.com/caseycs/claude-pr-resume-hook/commit/c26ef14b2b57c96a56e9e95751f64bbfe85a146a))
+* keep one collapsed footer per user, keyed on the GitHub login ([cd36d04](https://github.com/caseycs/claude-pr-resume-hook/commit/cd36d04a7d51ec32b4b5cf6d02ad10902f8e9d20))
+
 ## 0.1.0 (2026-08-06)
 
 
