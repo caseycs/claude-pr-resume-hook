@@ -31,14 +31,6 @@ that lets you jump straight back into that session later:
   it is. A colleague working the same PR from their own session gets a block
   alongside yours; each run only ever adds or updates its own, never touching
   anyone else's. Collapsed by default, so several stay out of the way.
-- **Both routes to a PR.** Fires on `gh pr create`/`gh pr edit` and on the GitHub
-  MCP server's `create_pull_request`/`update_pull_request`.
-- **Quiet.** Writes nothing when the body already says the right thing, so it
-  adds no PR activity and no notification noise. Paths under `$HOME` are written
-  tilde-relative, so nothing leaks your local account name.
-- **Never in the way.** It can't block a tool call, and it logs failures to
-  stderr rather than raising — a bad token or a network blip won't interrupt
-  your session.
 
 ## Why not `claude --from-pr`?
 
@@ -251,7 +243,6 @@ spurious write.
 
 ## Requirements
 
-- **Python 3.8+**, standard library only. `pytest` is needed just for the tests.
 - **uv** for the recommended install path; not required if you register the
   script directly with `python3`.
 - **`gh` CLI**, authenticated, unless you set `$GH_TOKEN`/`$GITHUB_TOKEN`
@@ -259,9 +250,6 @@ spurious write.
 - **A token with `repo` scope** (or the fine-grained equivalent) on any repo
   whose PRs the hook will touch — it needs `GET` and `PATCH` on
   `/repos/{owner}/{repo}/pulls/{number}`.
-- **Network access** to `api.github.com`.
-- **A Claude Code version supporting `PostToolUse` hooks** and the `if` field
-  on hook entries. `$CLAUDE_CONFIG_DIR` is honoured for user-scope installs.
 
 ## Development
 
