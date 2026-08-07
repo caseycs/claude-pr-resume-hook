@@ -9,14 +9,22 @@ create`/`gh pr edit` Bash call, appends (or replaces) a trailing footer:
 
     ---
 
-    Resume Claude session by `you`:
+    <details>
+    <summary>AI session - your-github-login</summary>
+
     ```
     cd ~/path/to/worktree; claude -r <session_id>
     ```
 
+    </details>
+
 The directory and session come straight from the hook event, so the footer
 always points at the session that produced the PR. Paths under $HOME are
-written tilde-relative so the footer never publishes a username.
+written tilde-relative so the footer never publishes a local username.
+
+Footers are keyed on the authenticated GitHub login, one block per person: a
+PR touched by several people carries a block each, and every run adds or
+updates only its own.
 
 Run with no arguments to act as the hook. Run `install` / `uninstall` to
 register or remove the hook in a Claude Code settings file.
@@ -65,6 +73,17 @@ INLINE_FOOTER_RE = re.compile(
     r"[ \t]*[*_]{0,2}Resume\s+(?:Claude\s+)?session[^\n`]*`cd [^`\n]*; claude -r [^`\n]*`[*_]{0,2}",
     re.IGNORECASE,
 )
+# The current footer: a collapsed <details> block whose summary names whose
+# session it is. One per user - see docs/adr/0006.
+FOOTER_DETAILS_RE = re.compile(
+    r"[ \t]*<details>[ \t]*\n"
+    r"[ \t]*<summary>[ \t]*AI session[ \t]*-[ \t]*(?P<user>[^<\n]*?)[ \t]*</summary>"
+    r".*?"
+    r"</details>[ \t]*",
+    re.DOTALL | re.IGNORECASE,
+)
+# A thematic break left dangling once the footers below it are lifted out.
+TRAILING_RULE_RE = re.compile(r"\n+[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*\s*\Z")
 # Characters safe to leave bare in a shell word. Everything else gets a
 # backslash, which keeps `~` expanding and `/` readable.
 SHELL_UNSAFE_RE = re.compile(r"([^\w@%+=:,./-])")
@@ -124,32 +143,95 @@ def normalize(body):
 
 
 def local_user():
-    """The local account name, used to say whose session the footer points at."""
+    """The local account name. Only a fallback - see github_login()."""
     try:
         return getpass.getuser()
     except Exception:
         return "unknown"
 
 
-def footer_for(cwd, session_id, user=None):
+def footer_user(token):
+    """Whose session a footer belongs to: the authenticated GitHub login.
+
+    This is the identity the footer is keyed on, so it has to be the *token's*
+    user rather than the PR author - editing someone else's PR must update your
+    own block, not theirs. Falls back to the local account name if the call
+    fails, which can produce a second block when the two names differ.
+    """
+    try:
+        login = api_request("GET", "/user", token).get("login")
+    except Exception as e:
+        print(f"{CONSOLE_SCRIPT}: could not read GitHub login ({e})", file=sys.stderr)
+        login = None
+    if login:
+        return login
+    fallback = local_user()
+    print(
+        f"{CONSOLE_SCRIPT}: falling back to local username {fallback!r}; "
+        "a footer under your GitHub login may already exist",
+        file=sys.stderr,
+    )
+    return fallback
+
+
+def footer_for(cwd, session_id, user):
     command = f"cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}"
-    return f"Resume Claude session by `{user or local_user()}`:\n```\n{command}\n```"
+    return (
+        "<details>\n"
+        f"<summary>AI session - {user}</summary>\n"
+        "\n"
+        f"```\n{command}\n```\n"
+        "\n"
+        "</details>"
+    )
 
 
-def strip_footers(body):
-    """Remove every footer, in any shape this tool has ever written or a human
-    has since edited it into."""
+def strip_legacy_footers(body):
+    """Remove footers written before the <details> format.
+
+    Those schemes only ever kept one footer per PR, so whoever wrote it, it is
+    superseded by the per-user block this run is about to write.
+    """
     without_blocks = FOOTER_BLOCK_RE.sub("\n", body)
     without_headings = FOOTER_LINE_RE.sub("", without_blocks)
     return INLINE_FOOTER_RE.sub("", without_headings)
 
 
-def build_body(body, cwd, session_id):
-    stripped = strip_footers(normalize(body)).rstrip()
-    footer = footer_for(cwd, session_id)
-    if stripped:
-        return f"{stripped}\n\n---\n\n{footer}\n"
-    return f"{footer}\n"
+def split_footers(body):
+    """Separate a body into (prose, [(user, footer_text), ...]).
+
+    Footers are lifted out in the order they appear, so rewriting one leaves
+    every other session's block exactly where its owner put it.
+    """
+    footers = []
+
+    def lift(match):
+        footers.append((match.group("user").strip(), match.group(0).strip()))
+        return "\n"
+
+    prose = FOOTER_DETAILS_RE.sub(lift, body)
+    prose = TRAILING_RULE_RE.sub("", prose)
+    return prose.rstrip(), footers
+
+
+def same_user(a, b):
+    """GitHub logins are case-insensitive."""
+    return a.strip().lower() == b.strip().lower()
+
+
+def build_body(body, cwd, session_id, user):
+    prose, footers = split_footers(strip_legacy_footers(normalize(body)))
+
+    ours = footer_for(cwd, session_id, user)
+    # Update our own block in place; never touch anyone else's.
+    updated = [(who, ours if same_user(who, user) else text) for who, text in footers]
+    if not any(same_user(who, user) for who, _ in updated):
+        updated.append((user, ours))
+
+    blocks = "\n\n".join(text for _, text in updated)
+    if prose:
+        return f"{prose}\n\n---\n\n{blocks}\n"
+    return f"{blocks}\n"
 
 
 # --- hook mode ---------------------------------------------------------------
@@ -268,7 +350,7 @@ def run_hook():
     # Compare against the normalized body, so a body that already carries the
     # right footer never triggers a pointless PATCH over CRLF differences alone.
     current_body = normalize(pr.get("body"))
-    new_body = build_body(current_body, cwd, session_id)
+    new_body = build_body(current_body, cwd, session_id, footer_user(token))
     if new_body == current_body:
         return 0
 

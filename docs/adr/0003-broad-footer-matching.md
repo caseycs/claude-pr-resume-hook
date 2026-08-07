@@ -1,5 +1,10 @@
 # Footer matching is deliberately broad
 
+> Superseded in part by [0006](./0006-one-footer-per-user.md): footers are now
+> kept one per user rather than collapsed to a single block. The breadth
+> described here still governs how a footer is recognised, and how footers from
+> older formats are stripped.
+
 The footer is a block — a thematic break, a heading naming the local user, and a
 fenced command:
 

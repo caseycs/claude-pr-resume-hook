@@ -7,10 +7,15 @@ the PR days later.
 ## Language
 
 **Resume footer**:
-The trailing block in a PR description naming whose session to return to and
-the command that returns to it: a horizontal rule, a heading, and a fenced
-command. A body carries exactly one, always last.
+A collapsed `<details>` block in a PR description naming whose session to
+return to and the command that returns to it. A body carries one per user, all
+of them after a single horizontal rule at the end.
 _Avoid_: footer line, resume link, signature, trailer
+
+**Footer owner**:
+The person a footer belongs to: the GitHub login of the token that wrote it,
+named in the block's summary. Decides which block a run may rewrite.
+_Avoid_: author, session user, committer
 
 **Session**:
 One Claude Code conversation, identified by its `session_id`. Resumable only

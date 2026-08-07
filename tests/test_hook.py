@@ -5,17 +5,27 @@ import pytest
 
 import claude_pr_resume_hook as hook
 
-HEADING = "Resume Claude session by `tester`:"
-FOOTER = f"{HEADING}\n```\ncd /work/tree; claude -r sess-abc\n```"
+FOOTER = (
+    "<details>\n"
+    "<summary>AI session - tester</summary>\n"
+    "\n"
+    "```\ncd /work/tree; claude -r sess-abc\n```\n"
+    "\n"
+    "</details>"
+)
 
 
 @pytest.fixture(autouse=True)
 def known_user(monkeypatch):
-    monkeypatch.setattr(hook, "local_user", lambda: "tester")
+    monkeypatch.setattr(hook, "local_user", lambda: "local-name")
 
 
-def headings_in(body):
-    return [line for line in body.splitlines() if "Resume" in line and "session" in line]
+def users_in(body):
+    return [m.group("user") for m in hook.FOOTER_DETAILS_RE.finditer(body)]
+
+
+def commands_in(body):
+    return [line for line in body.splitlines() if line.startswith("cd ")]
 
 
 def test_gh_pr_create_patches_the_body(run_event, event, api):
@@ -23,7 +33,7 @@ def test_gh_pr_create_patches_the_body(run_event, event, api):
 
     assert run_event(event()) == 0
 
-    assert [(m, p) for m, p, _ in api.calls] == [
+    assert api.pr_calls == [
         ("GET", "/repos/owner/repo/pulls/123"),
         ("PATCH", "/repos/owner/repo/pulls/123"),
     ]
@@ -70,7 +80,7 @@ def test_stale_footer_is_replaced_not_stacked(run_event, event, api):
     run_event(event())
 
     body = api.patches[0]["body"]
-    assert headings_in(body) == [HEADING]
+    assert users_in(body) == ["tester"]
     assert "old-sess" not in body
 
 
@@ -93,7 +103,7 @@ def test_hand_mangled_footer_is_replaced_not_stacked(run_event, event, api):
     run_event(event())
 
     body = api.patches[0]["body"]
-    assert headings_in(body) == [HEADING]
+    assert users_in(body) == ["tester"]
     assert body == f"Some description.\n\n---\n\n{FOOTER}\n"
 
 
@@ -111,10 +121,56 @@ def test_second_session_updates_the_footer_in_place(run_event, event, api):
     run_event(event(cwd="/other/tree", session_id="sess-xyz"))
 
     body = api.patches[0]["body"]
-    assert body == (
-        "Some description.\n\n---\n\n"
-        f"{HEADING}\n```\ncd /other/tree; claude -r sess-xyz\n```\n"
+    assert users_in(body) == ["tester"]
+    assert commands_in(body) == ["cd /other/tree; claude -r sess-xyz"]
+
+
+# --- whose footer is it ------------------------------------------------------
+
+
+def test_the_footer_is_keyed_on_the_github_login_not_the_local_user(run_event, event, api):
+    api.login = "caseycs"
+
+    run_event(event())
+
+    body = api.patches[0]["body"]
+    assert users_in(body) == ["caseycs"]
+    assert "local-name" not in body
+
+
+def test_the_identity_comes_from_the_token_not_the_pr_author(run_event, event, api):
+    """Editing someone else's PR must update your block, never theirs."""
+    api.login = "me"
+    api.body = (
+        "Their description.\n\n---\n\n"
+        "<details>\n<summary>AI session - them</summary>\n\n"
+        "```\ncd /theirs; claude -r their-sess\n```\n\n</details>\n"
     )
+
+    run_event(event())
+
+    body = api.patches[0]["body"]
+    assert users_in(body) == ["them", "me"]
+    assert "cd /theirs; claude -r their-sess" in body
+
+
+def test_a_failed_login_lookup_falls_back_to_the_local_name(run_event, event, api, capsys):
+    api.login_error = urllib.error.HTTPError("/user", 401, "Unauthorized", {}, None)
+
+    assert run_event(event()) == 0
+
+    assert users_in(api.patches[0]["body"]) == ["local-name"]
+    err = capsys.readouterr().err
+    assert "could not read GitHub login" in err
+    assert "falling back to local username" in err
+
+
+def test_an_empty_login_also_falls_back(run_event, event, api):
+    api.login = None
+
+    run_event(event())
+
+    assert users_in(api.patches[0]["body"]) == ["local-name"]
 
 
 # --- the GitHub MCP server route ---------------------------------------------
@@ -141,7 +197,7 @@ def test_mcp_create_pull_request_patches_the_body(run_event, api):
 
     assert run_event(mcp_event()) == 0
 
-    assert [(m, p) for m, p, _ in api.calls] == [
+    assert api.pr_calls == [
         ("GET", "/repos/o/r/pulls/9"),
         ("PATCH", "/repos/o/r/pulls/9"),
     ]
