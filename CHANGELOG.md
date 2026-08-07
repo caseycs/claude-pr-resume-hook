@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.1](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.2.0...v0.2.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* tag releases as vX.Y.Z so pinned installs resolve ([8d55b11](https://github.com/caseycs/claude-pr-resume-hook/commit/8d55b119b159b1ee5f1ef3a0b8f019eff1ae3839))
+* tag releases as vX.Y.Z so pinned installs resolve ([502e19e](https://github.com/caseycs/claude-pr-resume-hook/commit/502e19e77924e98e12702b9100880b4e5d2d877f))
+
 ## [0.2.0](https://github.com/caseycs/claude-pr-resume-hook/compare/claude-pr-resume-hook-v0.1.0...claude-pr-resume-hook-v0.2.0) (2026-08-07)
 
 
