@@ -14,9 +14,16 @@ def api(monkeypatch):
         def __init__(self):
             self.calls = []
             self.body = ""
+            # Whose session the footer is keyed on: the authenticated login.
+            self.login = "tester"
+            self.login_error = None
 
         def __call__(self, method, path, token, payload=None):
             self.calls.append((method, path, payload))
+            if path == "/user":
+                if self.login_error:
+                    raise self.login_error
+                return {"login": self.login}
             if method == "GET":
                 return {"body": self.body}
             return {}
@@ -24,6 +31,11 @@ def api(monkeypatch):
         @property
         def patches(self):
             return [payload for method, _, payload in self.calls if method == "PATCH"]
+
+        @property
+        def pr_calls(self):
+            """Calls about the PR itself, ignoring the identity lookup."""
+            return [(m, p) for m, p, _ in self.calls if p != "/user"]
 
     fake = FakeApi()
     monkeypatch.setattr(hook, "api_request", fake)

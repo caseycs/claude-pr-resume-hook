@@ -1,22 +1,30 @@
 # claude-pr-resume-hook
 
 A [Claude Code](https://code.claude.com) `PostToolUse` hook. Every time Claude
-runs `gh pr create` or `gh pr edit` in a session, it makes sure the resulting
-PR description ends with a line that lets you jump straight back into that
-session later:
+opens or edits a pull request in a session — through `gh pr create`/`gh pr edit`
+or the GitHub MCP server — it makes sure the PR description ends with a block
+that lets you jump straight back into that session later:
 
 > ---
 >
-> Resume Claude session by `ilia`:
+> <details>
+> <summary>AI session - caseycs</summary>
+>
 > ```
 > cd ~/github/my-repo; claude -r 85b3ce92-2e7b-432b-bf68-8ca769a1ad8a
 > ```
+>
+> </details>
 
 The directory and session id come from the hook event itself, so the footer
 always points at the exact worktree and session that produced — or last
-touched — the PR. The name is the local account the session belongs to, so on a
-shared repo you can tell whose session a PR came from. Paths under `$HOME` are
-written tilde-relative.
+touched — the PR. Paths under `$HOME` are written tilde-relative, so nothing
+leaks your local account name.
+
+The summary names the **GitHub login** whose session it is, and a PR carries
+**one block per person**. If a colleague also works on the PR from their own
+session, their block is added alongside yours; each run only ever adds or
+updates its own. Collapsed by default, so several of them stay out of the way.
 
 ## Install
 
@@ -42,7 +50,6 @@ To pin a release rather than track `main`:
 uv tool install git+https://github.com/caseycs/claude-pr-resume-hook@v0.1.0
 ```
 <!-- x-release-please-end -->
-
 
 Releases are cut by [release-please](.github/workflows/release.yml): merging the
 release PR it maintains tags that commit, publishes the GitHub Release, and
@@ -141,9 +148,11 @@ The hook reads the Claude Code hook event JSON from stdin:
 3. Fetches the current PR body and takes the session's `cwd`/`session_id`
    from the hook event, authenticating to the GitHub REST API with a token
    from `$GH_TOKEN`/`$GITHUB_TOKEN`, falling back to `gh auth token`.
-4. Strips any previous footer and appends a fresh one, so the body always
-   ends with exactly one.
-5. If the body would be unchanged, skips the `PATCH` entirely.
+4. Reads the token's own GitHub login via `GET /user` — that, not the PR
+   author, is whose footer this run owns.
+5. Rewrites its own block in place, or appends one, leaving every other
+   person's block exactly where it was.
+6. If the body would be unchanged, skips the `PATCH` entirely.
 
 The hook never blocks the tool call (`PostToolUse` can't block anyway) and
 logs failures to stderr rather than raising, so a broken token or a network
@@ -184,17 +193,17 @@ The footer is rewritten to stay correct rather than accumulating:
 
 | Existing body | Result |
 | --- | --- |
-| no footer | footer appended |
-| footer deleted by hand | footer appended again |
-| footer from a different session, worktree, or user | replaced in place |
-| footer reworded, emphasised, quoted, or moved up the body | replaced with a clean one at the end |
-| rule or fence deleted from the block | replaced with a well-formed one |
-| single-line footer from an earlier version | migrated to the block format |
-| several stacked footers | collapsed to one |
-| footer already correct | body left byte-for-byte alone, no API write |
+| no footer of yours | yours appended |
+| your footer deleted by hand | yours appended again |
+| your session or worktree changed | your block rewritten in place |
+| someone else's footer present | left untouched, yours added alongside |
+| your footer already correct | body left byte-for-byte alone, no API write |
+| footer from an earlier version's format | migrated to a `<details>` block |
 
-An unrelated fenced code block or horizontal rule elsewhere in the body is left
-alone; both are pinned by tests.
+Your block keeps its position when rewritten, so the order people appear in
+never shuffles. Matching is case-insensitive, since GitHub logins are. An
+unrelated `<details>`, fenced code block, or horizontal rule elsewhere in the
+body is left alone; all three are pinned by tests.
 
 Directories are rendered `~/…` when under `$HOME`, `~` when they *are* `$HOME`,
 and absolute otherwise. Shell metacharacters get backslash-escaped rather than
