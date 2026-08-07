@@ -16,15 +16,51 @@ that lets you jump straight back into that session later:
 >
 > </details>
 
-The directory and session id come from the hook event itself, so the footer
-always points at the exact worktree and session that produced — or last
-touched — the PR. Paths under `$HOME` are written tilde-relative, so nothing
-leaks your local account name.
+## Key features
 
-The summary names the **GitHub login** whose session it is, and a PR carries
-**one block per person**. If a colleague also works on the PR from their own
-session, their block is added alongside yours; each run only ever adds or
-updates its own. Collapsed by default, so several of them stay out of the way.
+- **A copy-pasteable command, not a lookup.** The footer carries the literal
+  `cd <dir>; claude -r <session-id>`. You read it off the PR page and paste it
+  into any terminal — nothing to resolve, no checkout required, no need to be in
+  a particular directory first.
+- **The directory is half the answer.** Both parts come from the hook event, so
+  the command lands in the exact worktree that produced the PR. That matters if
+  you run Claude under more than one `$HOME` to keep contexts separate: the `cd`
+  puts you in the right one rather than resuming against whichever context
+  happens to be current.
+- **One block per person.** The summary names the **GitHub login** whose session
+  it is. A colleague working the same PR from their own session gets a block
+  alongside yours; each run only ever adds or updates its own, never touching
+  anyone else's. Collapsed by default, so several stay out of the way.
+- **Both routes to a PR.** Fires on `gh pr create`/`gh pr edit` and on the GitHub
+  MCP server's `create_pull_request`/`update_pull_request`.
+- **Quiet.** Writes nothing when the body already says the right thing, so it
+  adds no PR activity and no notification noise. Paths under `$HOME` are written
+  tilde-relative, so nothing leaks your local account name.
+- **Never in the way.** It can't block a tool call, and it logs failures to
+  stderr rather than raising — a bad token or a network blip won't interrupt
+  your session.
+
+## Why not `claude --from-pr`?
+
+Claude Code ships `--from-pr`, which resumes a session linked to a PR by number
+or URL, or via an interactive picker. If that covers your workflow, you may not
+need this hook at all.
+
+It doesn't fit every shape of work:
+
+- **Tasks spanning several repositories.** When one task carries PRs across three
+  or more repos, there is no single PR to resume "the" session from, and you are
+  back to remembering which session belonged to which repo.
+- **It needs repository context.** Resolving a PR to a session leans on the git
+  repository you are sitting in. Reading a PR in the browser, on another machine,
+  or from a directory that is not a checkout leaves nothing to resolve against.
+- **Several Claude home directories.** If you keep separate `$HOME`s so Claude
+  holds separate contexts, the session you want may not live in the context that
+  is currently active — and nothing in a PR number says which one it is.
+
+The footer sidesteps all three by writing the answer into the PR itself. It is a
+plain shell command, so it travels: it works from any directory, on any machine
+that holds the session, and it states out loud which context to `cd` into first.
 
 ## Install
 
