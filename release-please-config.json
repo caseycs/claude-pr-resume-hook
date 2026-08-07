@@ -5,6 +5,7 @@
     ".": {
       "release-type": "python",
       "package-name": "claude-pr-resume-hook",
+      "include-component-in-tag": false,
       "extra-files": [{ "type": "generic", "path": "README.md" }],
       "changelog-sections": [
         { "type": "feat", "section": "Features" },
