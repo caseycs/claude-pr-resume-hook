@@ -1,20 +1,23 @@
 """Unit tests for the footer text itself.
 
-The contract, per user:
-  * no footer for you yet     -> yours appended, everyone else's untouched
-  * your footer removed       -> yours appended again
-  * your session changed      -> your block rewritten in place
-  * your footer already right -> body left byte-for-byte alone
+The contract, per user and session:
+  * no footer for this session yet -> appended at the bottom, others untouched
+  * your footer removed            -> yours appended again
+  * same session, new stamp/path   -> that block rewritten in place
+  * your footer already right      -> body left byte-for-byte alone
 
-Other people's footers are never rewritten, reordered, or removed.
+Other sessions' footers - yours or anyone's - are never rewritten, reordered,
+or removed.
 """
+import datetime
+
 import pytest
 
 import claude_pr_resume_hook as hook
 
 
-def build(body, cwd="/work/tree", session="sess-abc", user="tester"):
-    return hook.build_body(body, cwd, session, user)
+def build(body, cwd="/work/tree", session="sess-abc", user="tester", stamp=""):
+    return hook.build_body(body, cwd, session, user, stamp)
 
 
 def footer(user="tester", cwd="/work/tree", session="sess-abc"):
@@ -83,13 +86,41 @@ def test_is_idempotent_over_repeated_runs():
         body = build(body)
 
 
-def test_a_new_session_rewrites_your_block():
+def test_a_new_session_of_yours_is_appended_below():
     first = build("Body.", session="sess-1")
 
     second = build(first, session="sess-2")
 
-    assert commands_in(second) == ["cd /work/tree; claude -r sess-2"]
-    assert users_in(second) == ["tester"]
+    assert commands_in(second) == [
+        "cd /work/tree; claude -r sess-1",
+        "cd /work/tree; claude -r sess-2",
+    ]
+    assert users_in(second) == ["tester", "tester"]
+
+
+def test_the_same_session_rewrites_only_its_stamp():
+    first = build("Body.", session="s1", stamp=", 1 September 2026 10:00 UTC")
+    both = build(first, session="s2", stamp=", 2 September 2026 10:00 UTC")
+
+    result = build(both, session="s1", stamp=", 3 September 2026 10:00 UTC, Fable5.5/high")
+
+    assert [line for line in result.splitlines() if line.startswith("<summary>")] == [
+        "<summary>AI session - tester, 3 September 2026 10:00 UTC, Fable5.5/high</summary>",
+        "<summary>AI session - tester, 2 September 2026 10:00 UTC</summary>",
+    ]
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        ", 12 September 2026 14:05 CEST, Opus5.5/high",
+        " (fix, then ship (v2)), 12 September 2026 14:05 CEST, Opus5.5/high",
+    ],
+)
+def test_a_stamped_summary_still_yields_the_bare_login(stamp):
+    body = build("Body.", stamp=stamp)
+    assert users_in(body) == ["tester"]
+    assert build(body, stamp=stamp) == body
 
 
 def test_a_moved_worktree_rewrites_your_block():
@@ -127,20 +158,29 @@ def test_updating_your_block_preserves_position_and_others():
     both = build(build("Body.", cwd="/a", session="sa", user="alice"),
                  cwd="/b", session="sb", user="bob")
 
-    result = build(both, cwd="/a2", session="sa2", user="alice")
+    result = build(both, cwd="/a2", session="sa", user="alice")
 
     # alice stays first, bob is byte-for-byte unchanged
     assert users_in(result) == ["alice", "bob"]
-    assert commands_in(result) == ["cd /a2; claude -r sa2", "cd /b; claude -r sb"]
+    assert commands_in(result) == ["cd /a2; claude -r sa", "cd /b; claude -r sb"]
 
 
 def test_the_last_user_can_update_without_touching_earlier_ones():
     both = build(build("Body.", cwd="/a", session="sa", user="alice"),
                  cwd="/b", session="sb", user="bob")
 
-    result = build(both, cwd="/b2", session="sb2", user="bob")
+    result = build(both, cwd="/b2", session="sb", user="bob")
 
-    assert commands_in(result) == ["cd /a; claude -r sa", "cd /b2; claude -r sb2"]
+    assert commands_in(result) == ["cd /a; claude -r sa", "cd /b2; claude -r sb"]
+
+
+def test_another_users_session_is_never_taken_over():
+    """Even the same session id under a different login is someone else's block."""
+    alice = build("Body.", session="shared", user="alice")
+
+    result = build(alice, session="shared", user="bob")
+
+    assert users_in(result) == ["alice", "bob"]
 
 
 def test_three_users_all_survive():
@@ -165,10 +205,10 @@ def test_matching_is_case_insensitive():
     """GitHub logins are case-insensitive, so ALICE must not get a second block."""
     body = build("Body.", user="alice")
 
-    result = build(body, cwd="/new", session="s2", user="ALICE")
+    result = build(body, cwd="/new", user="ALICE")
 
     assert len(users_in(result)) == 1
-    assert commands_in(result) == ["cd /new; claude -r s2"]
+    assert commands_in(result) == ["cd /new; claude -r sess-abc"]
 
 
 def test_a_login_that_is_a_prefix_of_another_gets_its_own_block():
@@ -293,3 +333,52 @@ def test_escaping_leaves_the_tilde_and_slashes_bare(at_home):
     block = hook.footer_for("/Users/someone/my repo", "s1", "u")
     assert "cd ~/" in block
     assert "'" not in block and '"' not in block
+
+
+# --- summary stamp -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "model_id,expected",
+    [
+        ("claude-fable-5-5", "Fable5.5"),
+        ("claude-opus-5-5[1m]", "Opus5.5"),
+        ("claude-sonnet-5", "Sonnet5"),
+        ("claude-haiku-4-5-20251001", "Haiku4.5"),
+        ("claude-3-5-sonnet-20241022", "Sonnet3.5"),
+        ("some-model", "SomeModel"),
+    ],
+)
+def test_model_label(model_id, expected):
+    assert hook.model_label(model_id) == expected
+
+
+def test_stamp_has_date_time_model_and_effort():
+    when = datetime.datetime(2026, 9, 2, 8, 5, tzinfo=datetime.timezone.utc)
+    assert hook.session_stamp(when, "claude-fable-5-5", "high") == (
+        ", 2 September 2026 08:05 UTC, Fable5.5/high"
+    )
+    assert hook.session_stamp(when, None, "high") == ", 2 September 2026 08:05 UTC, high"
+    assert hook.session_stamp(when) == ", 2 September 2026 08:05 UTC"
+    assert hook.session_stamp() == ""
+
+
+def test_stamp_leads_with_the_session_name():
+    when = datetime.datetime(2026, 9, 2, 8, 5, tzinfo=datetime.timezone.utc)
+    assert hook.session_stamp(when, "claude-fable-5-5", "high", "pr-footers") == (
+        " (pr-footers), 2 September 2026 08:05 UTC, Fable5.5/high"
+    )
+    assert hook.session_stamp(name="  ") == ""
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("pr-footers", "pr-footers"),
+        ("two\n  lines", "two lines"),
+        ("</summary><b>x", "&lt;/summary&gt;&lt;b&gt;x"),
+        ("x" * 80, "x" * 59 + "…"),
+    ],
+)
+def test_session_name_is_one_safe_line(name, expected):
+    assert hook.session_name(name) == expected

@@ -1,5 +1,8 @@
 # One footer per user, keyed on the GitHub login
 
+> Widened by [0008](./0008-one-footer-per-session.md): the key is now login plus
+> session.
+
 A PR can be touched from more than one person's Claude Code session — you open
 it, a colleague edits it. Earlier versions collapsed the body to exactly one
 footer, so whoever ran last silently erased the previous person's way back into

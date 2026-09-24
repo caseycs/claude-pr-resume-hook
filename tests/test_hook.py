@@ -1,4 +1,6 @@
 """Usage tests: driving the hook with realistic Claude Code events."""
+import datetime
+import json
 import urllib.error
 
 import pytest
@@ -7,7 +9,7 @@ import claude_pr_resume_hook as hook
 
 FOOTER = (
     "<details>\n"
-    "<summary>AI session - tester</summary>\n"
+    "<summary>AI session - tester, 12 September 2026 14:05 UTC</summary>\n"
     "\n"
     "```\ncd /work/tree; claude -r sess-abc\n```\n"
     "\n"
@@ -15,9 +17,48 @@ FOOTER = (
 )
 
 
+FROZEN = datetime.datetime(2026, 9, 12, 14, 5, tzinfo=datetime.timezone.utc)
+
+
 @pytest.fixture(autouse=True)
 def known_user(monkeypatch):
     monkeypatch.setattr(hook, "local_user", lambda: "local-name")
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch):
+    """Pin the time the footer records, so runs are comparable."""
+
+    class Clock:
+        value = FROZEN
+
+    monkeypatch.setattr(hook, "now", lambda: Clock.value)
+    return Clock
+
+
+@pytest.fixture
+def transcript(tmp_path):
+    """Write a session transcript holding the given (model, effort) turns."""
+
+    def write(*turns, titles=()):
+        path = tmp_path / "session.jsonl"
+        lines = [{"type": "user", "message": {"role": "user", "content": "hi"}}]
+        for kind, title in titles:
+            key = "customTitle" if kind == "custom-title" else "aiTitle"
+            lines.append({"type": kind, key: title, "sessionId": "sess-abc"})
+        for model, effort in turns:
+            entry = {"type": "assistant", "message": {"role": "assistant", "model": model}}
+            if effort:
+                entry["effort"] = effort
+            lines.append(entry)
+        path.write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+        return str(path)
+
+    return write
+
+
+def summaries_in(body):
+    return [line for line in body.splitlines() if line.startswith("<summary>")]
 
 
 def users_in(body):
@@ -115,14 +156,108 @@ def test_manually_deleted_footer_is_restored(run_event, event, api):
     assert api.patches[0]["body"].endswith(f"{FOOTER}\n")
 
 
-def test_second_session_updates_the_footer_in_place(run_event, event, api):
+def test_a_second_session_of_yours_is_appended_below(run_event, event, api):
     api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
 
     run_event(event(cwd="/other/tree", session_id="sess-xyz"))
 
     body = api.patches[0]["body"]
+    assert users_in(body) == ["tester", "tester"]
+    assert commands_in(body) == [
+        "cd /work/tree; claude -r sess-abc",
+        "cd /other/tree; claude -r sess-xyz",
+    ]
+
+
+def test_the_same_session_later_only_moves_the_timestamp(run_event, event, api, clock):
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
+    clock.value = FROZEN + datetime.timedelta(days=2, hours=1)
+
+    run_event(event())
+
+    assert api.patches[0]["body"] == api.body.replace(
+        "12 September 2026 14:05", "14 September 2026 15:05"
+    )
+
+
+# --- when and on what model --------------------------------------------------
+
+
+def test_the_summary_names_the_model_and_effort(run_event, event, api, transcript):
+    path = transcript(("claude-opus-5-5", "medium"), ("claude-fable-5-5", "high"))
+
+    run_event(event(transcript_path=path))
+
+    assert summaries_in(api.patches[0]["body"]) == [
+        "<summary>AI session - tester, 12 September 2026 14:05 UTC, Fable5.5/high</summary>"
+    ]
+
+
+def test_a_model_switch_updates_the_summary(run_event, event, api, transcript):
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
+
+    run_event(event(transcript_path=transcript(("claude-sonnet-5", None))))
+
+    body = api.patches[0]["body"]
+    assert summaries_in(body) == [
+        "<summary>AI session - tester, 12 September 2026 14:05 UTC, Sonnet5</summary>"
+    ]
     assert users_in(body) == ["tester"]
-    assert commands_in(body) == ["cd /other/tree; claude -r sess-xyz"]
+
+
+def test_placeholder_models_are_skipped(run_event, event, api, transcript):
+    path = transcript(("claude-opus-5-5", "low"), ("<synthetic>", None))
+
+    run_event(event(transcript_path=path))
+
+    assert "Opus5.5/low</summary>" in api.patches[0]["body"]
+
+
+def test_the_summary_names_the_session(run_event, event, api, transcript):
+    path = transcript(("claude-fable-5-5", "high"), titles=[("ai-title", "Multiple sessions")])
+
+    run_event(event(transcript_path=path))
+
+    body = api.patches[0]["body"]
+    assert summaries_in(body) == [
+        "<summary>AI session - tester (Multiple sessions), "
+        "12 September 2026 14:05 UTC, Fable5.5/high</summary>"
+    ]
+    assert users_in(body) == ["tester"]
+
+
+def test_a_renamed_session_beats_the_generated_title(run_event, event, api, transcript):
+    path = transcript(
+        ("claude-fable-5-5", "high"),
+        titles=[
+            ("custom-title", "first name"),
+            ("custom-title", "pr-footers"),
+            ("ai-title", "Generated later"),
+        ],
+    )
+
+    run_event(event(transcript_path=path))
+
+    assert "AI session - tester (pr-footers), " in api.patches[0]["body"]
+
+
+def test_a_rename_updates_the_existing_block(run_event, event, api, transcript):
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
+
+    run_event(event(transcript_path=transcript(titles=[("custom-title", "renamed")])))
+
+    body = api.patches[0]["body"]
+    assert summaries_in(body) == [
+        "<summary>AI session - tester (renamed), 12 September 2026 14:05 UTC</summary>"
+    ]
+
+
+def test_a_missing_transcript_still_writes_a_footer(run_event, event, api, tmp_path):
+    run_event(event(transcript_path=str(tmp_path / "gone.jsonl")))
+
+    assert summaries_in(api.patches[0]["body"]) == [
+        "<summary>AI session - tester, 12 September 2026 14:05 UTC</summary>"
+    ]
 
 
 # --- whose footer is it ------------------------------------------------------
