@@ -40,9 +40,12 @@ def clock(monkeypatch):
 def transcript(tmp_path):
     """Write a session transcript holding the given (model, effort) turns."""
 
-    def write(*turns):
+    def write(*turns, titles=()):
         path = tmp_path / "session.jsonl"
         lines = [{"type": "user", "message": {"role": "user", "content": "hi"}}]
+        for kind, title in titles:
+            key = "customTitle" if kind == "custom-title" else "aiTitle"
+            lines.append({"type": kind, key: title, "sessionId": "sess-abc"})
         for model, effort in turns:
             entry = {"type": "assistant", "message": {"role": "assistant", "model": model}}
             if effort:
@@ -208,6 +211,45 @@ def test_placeholder_models_are_skipped(run_event, event, api, transcript):
     run_event(event(transcript_path=path))
 
     assert "Opus5.5/low</summary>" in api.patches[0]["body"]
+
+
+def test_the_summary_names_the_session(run_event, event, api, transcript):
+    path = transcript(("claude-fable-5-5", "high"), titles=[("ai-title", "Multiple sessions")])
+
+    run_event(event(transcript_path=path))
+
+    body = api.patches[0]["body"]
+    assert summaries_in(body) == [
+        "<summary>AI session - tester (Multiple sessions), "
+        "12 September 2026 14:05 UTC, Fable5.5/high</summary>"
+    ]
+    assert users_in(body) == ["tester"]
+
+
+def test_a_renamed_session_beats_the_generated_title(run_event, event, api, transcript):
+    path = transcript(
+        ("claude-fable-5-5", "high"),
+        titles=[
+            ("custom-title", "first name"),
+            ("custom-title", "pr-footers"),
+            ("ai-title", "Generated later"),
+        ],
+    )
+
+    run_event(event(transcript_path=path))
+
+    assert "AI session - tester (pr-footers), " in api.patches[0]["body"]
+
+
+def test_a_rename_updates_the_existing_block(run_event, event, api, transcript):
+    api.body = f"Some description.\n\n---\n\n{FOOTER}\n"
+
+    run_event(event(transcript_path=transcript(titles=[("custom-title", "renamed")])))
+
+    body = api.patches[0]["body"]
+    assert summaries_in(body) == [
+        "<summary>AI session - tester (renamed), 12 September 2026 14:05 UTC</summary>"
+    ]
 
 
 def test_a_missing_transcript_still_writes_a_footer(run_event, event, api, tmp_path):

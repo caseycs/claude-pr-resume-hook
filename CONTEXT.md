@@ -8,7 +8,8 @@ the PR days later.
 
 **Resume footer**:
 A collapsed `<details>` block in a PR description naming whose session to
-return to, when it last touched the PR and on what model/effort, and the command
+return to, the session's name, when it last touched the PR and on what
+model/effort, and the command
 that returns to it. A body carries one per user and session, all of them after a
 single horizontal rule at the end.
 _Avoid_: footer line, resume link, signature, trailer

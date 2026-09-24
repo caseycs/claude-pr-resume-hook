@@ -110,9 +110,17 @@ def test_the_same_session_rewrites_only_its_stamp():
     ]
 
 
-def test_a_stamped_summary_still_yields_the_bare_login():
-    body = build("Body.", stamp=", 12 September 2026 14:05 CEST, Opus5.5/high")
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        ", 12 September 2026 14:05 CEST, Opus5.5/high",
+        " (fix, then ship (v2)), 12 September 2026 14:05 CEST, Opus5.5/high",
+    ],
+)
+def test_a_stamped_summary_still_yields_the_bare_login(stamp):
+    body = build("Body.", stamp=stamp)
     assert users_in(body) == ["tester"]
+    assert build(body, stamp=stamp) == body
 
 
 def test_a_moved_worktree_rewrites_your_block():
@@ -353,3 +361,24 @@ def test_stamp_has_date_time_model_and_effort():
     assert hook.session_stamp(when, None, "high") == ", 2 September 2026 08:05 UTC, high"
     assert hook.session_stamp(when) == ", 2 September 2026 08:05 UTC"
     assert hook.session_stamp() == ""
+
+
+def test_stamp_leads_with_the_session_name():
+    when = datetime.datetime(2026, 9, 2, 8, 5, tzinfo=datetime.timezone.utc)
+    assert hook.session_stamp(when, "claude-fable-5-5", "high", "pr-footers") == (
+        " (pr-footers), 2 September 2026 08:05 UTC, Fable5.5/high"
+    )
+    assert hook.session_stamp(name="  ") == ""
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("pr-footers", "pr-footers"),
+        ("two\n  lines", "two lines"),
+        ("</summary><b>x", "&lt;/summary&gt;&lt;b&gt;x"),
+        ("x" * 80, "x" * 59 + "…"),
+    ],
+)
+def test_session_name_is_one_safe_line(name, expected):
+    assert hook.session_name(name) == expected
