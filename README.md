@@ -77,7 +77,7 @@ To pin a release rather than track `main`:
 
 <!-- x-release-please-start-version -->
 ```bash
-uv tool install git+https://github.com/caseycs/claude-pr-resume-hook@v0.2.1
+uv tool install git+https://github.com/caseycs/claude-pr-resume-hook@v0.3.0
 ```
 <!-- x-release-please-end -->
 
