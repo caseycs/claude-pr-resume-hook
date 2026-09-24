@@ -10,7 +10,7 @@ tools - appends (or replaces) a trailing footer:
 
     ---
 
-    <details>
+    <details data-generator="caseycs/claude-pr-resume-hook" data-updated="2026-09-24T09:28:00+02:00">
     <summary>AI session - your-github-login (session name), 24 September 2026 09:28 CEST, Opus5.5/high</summary>
 
     ```
@@ -27,7 +27,9 @@ Footers are keyed on the authenticated GitHub login plus the session, one block
 per session: a PR touched by several people, or by one person from several
 sessions, carries a block each, and every run adds or updates only its own. The
 summary records the session's name, when it last touched the PR and the
-model/effort it ran on, all read from the session transcript.
+model/effort it ran on, all read from the session transcript. Blocks are kept in
+time order, oldest first, and blocks lost to a description edit are restored
+from GitHub's edit history - see docs/adr/0009.
 
 Run with no arguments to act as the hook. Run `install` / `uninstall` to
 register or remove the hook in a Claude Code settings file.
@@ -84,13 +86,35 @@ INLINE_FOOTER_RE = re.compile(
 # model. One per user and session - see docs/adr/0006 and 0008. Logins never
 # contain commas or parentheses, so the login ends at the first of either.
 FOOTER_DETAILS_RE = re.compile(
-    r"[ \t]*<details>[ \t]*\n"
+    r"[ \t]*<details(?P<attrs>(?:[ \t][^>\n]*)?)>[ \t]*\n"
     r"[ \t]*<summary>[ \t]*AI session[ \t]*-[ \t]*(?P<user>[^<\n,(]*?)[ \t]*"
     r"(?:[,(][^<\n]*)?</summary>"
     r".*?"
     r"</details>[ \t]*",
     re.DOTALL | re.IGNORECASE,
 )
+# Every block this tool writes names it, so it can tell its own blocks from a
+# look-alike written by something else. Blocks from before 0.4 carry no
+# generator at all and still count as ours.
+FOOTER_GENERATOR = "caseycs/claude-pr-resume-hook"
+GENERATOR_ATTR_RE = re.compile(r'\bdata-generator="([^"]*)"', re.IGNORECASE)
+# When a footer was last written, machine-readable, for ordering blocks. Blocks
+# from before it existed fall back to the date in their summary.
+FOOTER_UPDATED_RE = re.compile(r'<details[^>\n]*\bdata-updated="([^"]+)"', re.IGNORECASE)
+SUMMARY_DATE_RE = re.compile(r"<summary>[^<\n]*?, (\d{1,2} [A-Za-z]+ \d{4} \d{2}:\d{2})")
+# A `gh pr edit` that rewrites the description, rather than only the title or labels.
+GH_BODY_FLAG_RE = re.compile(r"(?:^|\s)(?:-b|--body|-F|--body-file)(?=[\s=]|$)")
+# Only an edit this recent can be the one that just ran; see previous_body().
+EDIT_WINDOW = datetime.timedelta(minutes=10)
+PREVIOUS_BODY_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      userContentEdits(last: 2) { nodes { editedAt diff } }
+    }
+  }
+}
+"""
 # The session a footer resumes, read back out of its command.
 FOOTER_SESSION_RE = re.compile(r"claude -r (\S+)")
 # The date suffix on a pinned model id, e.g. the 20251001 in claude-haiku-4-5-20251001.
@@ -287,10 +311,14 @@ def session_stamp(when=None, model=None, effort=None, name=None):
     return (f" ({named})" if named else "") + "".join(f", {part}" for part in parts)
 
 
-def footer_for(cwd, session_id, user, stamp=""):
+def footer_for(cwd, session_id, user, stamp="", updated=None):
     command = f"cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}"
+    attrs = f' data-generator="{FOOTER_GENERATOR}"'
+    if updated:
+        attrs += f' data-updated="{updated.isoformat(timespec="seconds")}"'
+
     return (
-        "<details>\n"
+        f"<details{attrs}>\n"
         f"<summary>AI session - {user}{stamp}</summary>\n"
         "\n"
         f"```\n{command}\n```\n"
@@ -313,12 +341,15 @@ def strip_legacy_footers(body):
 def split_footers(body):
     """Separate a body into (prose, [(user, session, footer_text), ...]).
 
-    Footers are lifted out in the order they appear, so rewriting one leaves
-    every other session's block exactly where its owner put it.
+    Footers are lifted out in the order they appear. A look-alike block naming
+    a different generator isn't ours, and stays in the prose untouched.
     """
     footers = []
 
     def lift(match):
+        generator = GENERATOR_ATTR_RE.search(match.group("attrs"))
+        if generator and generator.group(1) != FOOTER_GENERATOR:
+            return match.group(0)
         session = FOOTER_SESSION_RE.search(match.group(0))
         footers.append((
             match.group("user").strip(),
@@ -337,20 +368,58 @@ def same_user(a, b):
     return a.strip().lower() == b.strip().lower()
 
 
-def build_body(body, cwd, session_id, user, stamp=""):
+def footer_time(text):
+    """When a footer was last written, as a sortable number, or None if unknown."""
+    stamped = FOOTER_UPDATED_RE.search(text)
+    if stamped:
+        try:
+            return datetime.datetime.fromisoformat(stamped.group(1)).timestamp()
+        except ValueError:
+            pass
+    # Written before data-updated existed: the summary's date, zone ignored, is
+    # close enough to order it among the others.
+    dated = SUMMARY_DATE_RE.search(text)
+    if dated:
+        try:
+            when = datetime.datetime.strptime(dated.group(1), "%d %B %Y %H:%M")
+        except ValueError:
+            return None
+        return when.replace(tzinfo=datetime.timezone.utc).timestamp()
+    return None
+
+
+def footer_key(who, session):
+    return who.strip().lower(), session
+
+
+def build_body(body, cwd, session_id, user, stamp="", updated=None, previous=None):
+    """The body with this session's footer written in.
+
+    `previous` is the body as it was before the edit that triggered this run, if
+    known: footers it had that the edit dropped are put back.
+    """
     prose, footers = split_footers(strip_legacy_footers(normalize(body)))
 
-    ours = footer_for(cwd, session_id, user, stamp)
+    if previous:
+        present = {footer_key(who, s) for who, s, _ in footers}
+        _, before = split_footers(normalize(previous))
+        footers += [f for f in before if footer_key(f[0], f[1]) not in present]
+
+    ours = footer_for(cwd, session_id, user, stamp, updated)
     session = shell_escape(session_id)
 
     def is_ours(who, their_session):
         return same_user(who, user) and their_session == session
 
-    # Update this session's block in place; another session - yours or anyone
-    # else's - keeps its own, and a new session goes at the bottom.
+    # Rewrite this session's block; another session - yours or anyone else's -
+    # keeps its own, and a new session is added.
     blocks = [ours if is_ours(who, s) else text for who, s, text in footers]
     if not any(is_ours(who, s) for who, s, _ in footers):
         blocks.append(ours)
+
+    # Oldest first. The sort is stable, so blocks with no known time stay put,
+    # ahead of every dated one.
+    blocks.sort(key=lambda text: (footer_time(text) is not None, footer_time(text) or 0))
 
     blocks = "\n\n".join(blocks)
     if prose:
@@ -540,6 +609,60 @@ def pr_from_mcp(event, tool):
     return None
 
 
+def edits_body(event):
+    """Whether the call rewrote the PR description, and so may have dropped footers."""
+    tool_name = event.get("tool_name") or ""
+    tool_input = event.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return False
+    if tool_name == "Bash":
+        command = tool_input.get("command") or ""
+        found = GH_PR_COMMAND_RE.search(command)
+        return bool(found and found.group(1) == "edit" and GH_BODY_FLAG_RE.search(command[found.end():]))
+    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
+    return bool(mcp_tool and mcp_tool.group("tool") == "update_pull_request" and "body" in tool_input)
+
+
+def parse_github_time(text):
+    return datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def previous_body(owner, repo, number, token, current_body):
+    """The description as it was before the edit that produced `current_body`, or None.
+
+    GitHub keeps every revision of a description; each edit's `diff` is in fact
+    the full text after that edit. Only trusted when the newest revision is the
+    current body and was written moments ago - otherwise the edit that just ran
+    didn't touch the description, and the one before it may be a person's
+    deliberate removal, which must stay removed.
+    """
+    try:
+        data = api_request("POST", "/graphql", token, {
+            "query": PREVIOUS_BODY_QUERY,
+            "variables": {"owner": owner, "repo": repo, "number": int(number)},
+        })
+        nodes = data["data"]["repository"]["pullRequest"]["userContentEdits"]["nodes"]
+    except Exception as e:
+        print(f"{CONSOLE_SCRIPT}: could not read the description's edit history ({e})", file=sys.stderr)
+        return None
+    try:
+        nodes = sorted(
+            (n for n in nodes if n and n.get("editedAt") and isinstance(n.get("diff"), str)),
+            key=lambda n: parse_github_time(n["editedAt"]),
+            reverse=True,
+        )
+        if len(nodes) < 2:
+            return None
+        latest, before = nodes[0], nodes[1]
+        if normalize(latest["diff"]).strip() != current_body.strip():
+            return None
+        if now() - parse_github_time(latest["editedAt"]) > EDIT_WINDOW:
+            return None
+    except (TypeError, ValueError, KeyError):
+        return None
+    return normalize(before["diff"])
+
+
 def run_hook():
     event = json.load(sys.stdin)
 
@@ -576,9 +699,16 @@ def run_hook():
     # Compare against the normalized body, so a body that already carries the
     # right footer never triggers a pointless PATCH over CRLF differences alone.
     current_body = normalize(pr.get("body"))
+    # A rewritten description may have dropped other sessions' footers - Claude
+    # usually writes a new body from scratch - so recover them from the revision
+    # before. Our own block is rewritten regardless.
+    previous = previous_body(owner, repo, number, token, current_body) if edits_body(event) else None
     model, effort, name = read_transcript(event.get("transcript_path"))
-    stamp = session_stamp(now(), model, effort, name)
-    new_body = build_body(current_body, cwd, session_id, footer_user(token), stamp)
+    when = now()
+    stamp = session_stamp(when, model, effort, name)
+    new_body = build_body(
+        current_body, cwd, session_id, footer_user(token), stamp, updated=when, previous=previous
+    )
     if new_body == current_body:
         return 0
 

@@ -16,8 +16,8 @@ import pytest
 import claude_pr_resume_hook as hook
 
 
-def build(body, cwd="/work/tree", session="sess-abc", user="tester", stamp=""):
-    return hook.build_body(body, cwd, session, user, stamp)
+def build(body, cwd="/work/tree", session="sess-abc", user="tester", stamp="", **kwargs):
+    return hook.build_body(body, cwd, session, user, stamp, **kwargs)
 
 
 def footer(user="tester", cwd="/work/tree", session="sess-abc"):
@@ -41,7 +41,7 @@ def test_footer_is_a_collapsed_details_block():
         "\n"
         "---\n"
         "\n"
-        "<details>\n"
+        '<details data-generator="caseycs/claude-pr-resume-hook">\n'
         "<summary>AI session - tester</summary>\n"
         "\n"
         "```\n"
@@ -55,7 +55,7 @@ def test_footer_is_a_collapsed_details_block():
 def test_blank_lines_inside_details_keep_the_fence_rendering():
     """GitHub only renders markdown inside <details> when blank lines separate it."""
     block = footer()
-    assert block.startswith("<details>\n<summary>")
+    assert block.startswith('<details data-generator="caseycs/claude-pr-resume-hook">\n<summary>')
     assert "</summary>\n\n```" in block
     assert "```\n\n</details>" in block
 
@@ -98,16 +98,91 @@ def test_a_new_session_of_yours_is_appended_below():
     assert users_in(second) == ["tester", "tester"]
 
 
-def test_the_same_session_rewrites_only_its_stamp():
-    first = build("Body.", session="s1", stamp=", 1 September 2026 10:00 UTC")
-    both = build(first, session="s2", stamp=", 2 September 2026 10:00 UTC")
+def at(day, hour=10):
+    return datetime.datetime(2026, 9, day, hour, tzinfo=datetime.timezone.utc)
 
-    result = build(both, session="s1", stamp=", 3 September 2026 10:00 UTC, Fable5.5/high")
 
-    assert [line for line in result.splitlines() if line.startswith("<summary>")] == [
-        "<summary>AI session - tester, 3 September 2026 10:00 UTC, Fable5.5/high</summary>",
+def summaries(body):
+    return [line for line in body.splitlines() if line.startswith("<summary>")]
+
+
+def test_a_returning_session_is_rewritten_and_moves_to_the_bottom():
+    first = build("Body.", session="s1", stamp=", 1 September 2026 10:00 UTC", updated=at(1))
+    both = build(first, session="s2", stamp=", 2 September 2026 10:00 UTC", updated=at(2))
+
+    result = build(both, session="s1", stamp=", 3 September 2026 10:00 UTC, Fable5.5/high",
+                   updated=at(3))
+
+    assert summaries(result) == [
         "<summary>AI session - tester, 2 September 2026 10:00 UTC</summary>",
+        "<summary>AI session - tester, 3 September 2026 10:00 UTC, Fable5.5/high</summary>",
     ]
+
+
+def test_the_block_records_when_it_was_written():
+    block = hook.footer_for("/w", "s1", "u", updated=at(2, 8))
+    assert block.startswith(
+        '<details data-generator="caseycs/claude-pr-resume-hook"'
+        ' data-updated="2026-09-02T08:00:00+00:00">\n<summary>'
+    )
+
+
+def test_blocks_are_ordered_oldest_first_whatever_their_zone():
+    cest = datetime.timezone(datetime.timedelta(hours=2))
+    body = build("Body.", session="late", user="alice", updated=at(5, 12))
+    # 13:00 CEST is 11:00 UTC: earlier than alice's block despite the later clock.
+    body = build(body, session="early", user="bob",
+                 updated=datetime.datetime(2026, 9, 5, 13, tzinfo=cest))
+
+    assert users_in(body) == ["bob", "alice"]
+
+
+def test_undated_blocks_stay_ahead_of_dated_ones_in_their_order():
+    body = build("Body.", session="a", user="alice")
+    body = build(body, session="b", user="bob")
+
+    result = build(body, session="c", user="carol", updated=at(1))
+
+    assert users_in(result) == ["alice", "bob", "carol"]
+
+
+def test_blocks_from_0_3_are_dated_by_their_summary():
+    old = build("Body.", session="old", user="alice", stamp=", 4 September 2026 09:00 CEST")
+    newer = build(old, session="new", user="bob", updated=at(3))
+
+    assert users_in(newer) == ["bob", "alice"]
+
+
+# --- recovering from the previous revision ----------------------------------
+
+
+def test_footers_the_edit_dropped_are_restored():
+    before = build("Old description.", session="sa", user="alice", updated=at(1))
+    before = build(before, session="sb", user="bob", updated=at(2))
+
+    result = build("Rewritten by Claude.", session="mine", updated=at(3), previous=before)
+
+    assert result.startswith("Rewritten by Claude.\n\n---\n\n")
+    assert users_in(result) == ["alice", "bob", "tester"]
+    assert "Old description." not in result
+
+
+def test_restoring_keeps_a_footer_the_edit_kept_rather_than_duplicating_it():
+    before = build("Body.", session="sa", user="alice", updated=at(1))
+    kept = build(before, session="sb", user="bob", updated=at(2))
+
+    result = build(kept, session="sb", user="bob", updated=at(3), previous=before)
+
+    assert users_in(result) == ["alice", "bob"]
+
+
+def test_this_sessions_old_block_is_replaced_not_restored():
+    before = build("Body.", session="mine", updated=at(1))
+
+    result = build("New body.", session="mine", updated=at(2), previous=before)
+
+    assert users_in(result) == ["tester"]
+    assert 'data-updated="2026-09-02' in result
 
 
 @pytest.mark.parametrize(
@@ -331,8 +406,9 @@ def test_shell_metacharacters_are_backslash_escaped(at_home, cwd, expected):
 
 def test_escaping_leaves_the_tilde_and_slashes_bare(at_home):
     block = hook.footer_for("/Users/someone/my repo", "s1", "u")
-    assert "cd ~/" in block
-    assert "'" not in block and '"' not in block
+    command = next(line for line in block.splitlines() if line.startswith("cd "))
+    assert command.startswith("cd ~/")
+    assert "'" not in command and '"' not in command
 
 
 # --- summary stamp -----------------------------------------------------------
@@ -382,3 +458,27 @@ def test_stamp_leads_with_the_session_name():
 )
 def test_session_name_is_one_safe_line(name, expected):
     assert hook.session_name(name) == expected
+
+
+# --- generator --------------------------------------------------------------
+
+
+def test_a_look_alike_from_another_tool_is_left_alone():
+    theirs = (
+        '<details data-generator="someone/other-tool">\n'
+        "<summary>AI session - tester</summary>\n\n```\ncd /x; claude -r sess-abc\n```\n\n</details>"
+    )
+    body = f"Body.\n\n{theirs}"
+
+    result = build(body)
+
+    assert theirs in result
+    assert users_in(result.replace(theirs, "")) == ["tester"]
+
+
+def test_a_block_from_before_the_generator_still_counts_as_ours():
+    old = "<details>\n<summary>AI session - tester</summary>\n\n```\ncd /old; claude -r sess-abc\n```\n\n</details>"
+
+    result = build(f"Body.\n\n---\n\n{old}\n")
+
+    assert result == build("Body.")

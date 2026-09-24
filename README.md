@@ -203,9 +203,13 @@ The hook reads the Claude Code hook event JSON from stdin:
    the event itself doesn't carry: the model and effort of the latest assistant
    turn, and the session name — the one you set with `/rename`, else the title
    Claude Code generated. These go into the summary with the current local time.
-6. Rewrites the block for this login *and* session in place, or appends one at
-   the bottom, leaving every other block exactly where it was.
-7. If the body would be unchanged, skips the `PATCH` entirely.
+6. If the call rewrote the description (`gh pr edit` with `--body`/`--body-file`,
+   or MCP `update_pull_request` with a `body`), fetches the version before it
+   from GitHub's edit history and puts back any footer blocks the edit dropped.
+7. Rewrites the block for this login *and* session, or adds one, and orders all
+   blocks by when they were last written — oldest first, so the session that
+   just ran is last.
+8. If the body would be unchanged, skips the `PATCH` entirely.
 
 The hook never blocks the tool call (`PostToolUse` can't block anyway) and
 logs failures to stderr rather than raising, so a broken token or a network
@@ -246,17 +250,37 @@ The footer is rewritten to stay correct rather than accumulating:
 
 | Existing body | Result |
 | --- | --- |
-| no footer of yours | yours appended |
-| your footer deleted by hand | yours appended again |
-| your session or worktree changed | your block rewritten in place |
-| someone else's footer present | left untouched, yours added alongside |
-| your footer already correct | body left byte-for-byte alone, no API write |
+| no block for this session | one added |
+| this session's block | rewritten with the new time, model and path |
+| your block from another session | left untouched, this session's added |
+| someone else's block | left untouched |
+| blocks dropped by Claude rewriting the description | restored from the previous revision |
+| blocks you deleted by hand | stay deleted, except this session's own |
 | footer from an earlier version's format | migrated to a `<details>` block |
 
-Your block keeps its position when rewritten, so the order people appear in
-never shuffles. Matching is case-insensitive, since GitHub logins are. An
-unrelated `<details>`, fenced code block, or horizontal rule elsewhere in the
-body is left alone; all three are pinned by tests.
+Each block's tag identifies it and its time, both hidden when GitHub renders
+the page:
+
+```html
+<details data-generator="caseycs/claude-pr-resume-hook" data-updated="2026-09-12T14:05:00+02:00">
+```
+
+A look-alike block naming a different `data-generator` is never touched; blocks
+from before 0.4, which carry none, still count as this tool's.
+
+Blocks are ordered by when they were last written, oldest first. `data-updated`
+carries a numeric offset, so blocks written from different time zones sort
+correctly. Blocks from 0.3.x,
+which lack it, are dated from their summary; older ones without a date go
+first. Matching is case-insensitive, since GitHub logins are. An unrelated
+`<details>`, fenced code block, or horizontal rule elsewhere in the body is left
+alone; all three are pinned by tests.
+
+Restoring is deliberately narrow. The hook only consults the edit history
+after a call that rewrote the description, and only trusts it when the newest
+revision *is* the current description and is under ten minutes old. So a block
+you removed by hand earlier stays removed even if Claude later edits the title
+or the description.
 
 Directories are rendered `~/…` when under `$HOME`, `~` when they *are* `$HOME`,
 and absolute otherwise. Shell metacharacters get backslash-escaped rather than

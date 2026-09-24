@@ -17,6 +17,9 @@ def api(monkeypatch):
             # Whose session the footer is keyed on: the authenticated login.
             self.login = "tester"
             self.login_error = None
+            # Revisions of the description, as (editedAt, body), oldest first.
+            self.edits = []
+            self.edits_error = None
 
         def __call__(self, method, path, token, payload=None):
             self.calls.append((method, path, payload))
@@ -24,6 +27,13 @@ def api(monkeypatch):
                 if self.login_error:
                     raise self.login_error
                 return {"login": self.login}
+            if path == "/graphql":
+                if self.edits_error:
+                    raise self.edits_error
+                nodes = [{"editedAt": at, "diff": body} for at, body in self.edits[-2:]]
+                # GitHub lists them newest first.
+                nodes.reverse()
+                return {"data": {"repository": {"pullRequest": {"userContentEdits": {"nodes": nodes}}}}}
             if method == "GET":
                 return {"body": self.body}
             return {}
@@ -34,8 +44,12 @@ def api(monkeypatch):
 
         @property
         def pr_calls(self):
-            """Calls about the PR itself, ignoring the identity lookup."""
-            return [(m, p) for m, p, _ in self.calls if p != "/user"]
+            """REST calls about the PR itself, ignoring identity and history lookups."""
+            return [(m, p) for m, p, _ in self.calls if p not in ("/user", "/graphql")]
+
+        @property
+        def history_calls(self):
+            return [payload for _, path, payload in self.calls if path == "/graphql"]
 
     fake = FakeApi()
     monkeypatch.setattr(hook, "api_request", fake)
