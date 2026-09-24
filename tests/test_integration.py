@@ -86,7 +86,9 @@ def test_install_writes_the_absolute_shim_path(shim, tmp_path):
     assert result.returncode == 0, result.stderr
     commands = {e["command"] for e in entries_of(tmp_path)}
     assert commands == {str(shim.resolve())}
-    assert [e["if"] for e in entries_of(tmp_path)] == ["Bash(gh pr create*)", "Bash(gh pr edit*)"]
+    assert [e["if"] for e in entries_of(tmp_path)] == [
+        "Bash(gh pr create*)", "Bash(gh pr edit*)", "Bash(gh pr comment*)", "Bash(gh pr review*)",
+    ]
 
 
 def test_the_installed_command_string_actually_executes(shim, tmp_path):

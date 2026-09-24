@@ -1,9 +1,10 @@
 # claude-pr-resume-hook
 
 A [Claude Code](https://code.claude.com) `PostToolUse` hook. Every time Claude
-opens or edits a pull request in a session — through `gh pr create`/`gh pr edit`
-or the GitHub MCP server — it makes sure the PR description ends with a block
-that lets you jump straight back into that session later:
+opens, edits, comments on or reviews a pull request in a session — through
+`gh pr create|edit|comment|review` or the GitHub MCP server — it makes sure the
+PR description ends with a block that lets you jump straight back into that
+session later:
 
 > ---
 >
@@ -102,6 +103,8 @@ settings ..................... /Users/you/.claude/settings.json
   gh pr edit ................. stale path, updating
                        was  python3 /old/checkout/append_resume_footer.py
                        now  /Users/you/.local/bin/claude-pr-resume-hook
+  gh pr comment .............. adding
+  gh pr review ............... adding
   github mcp pull requests ... adding
 backup ....................... settings.json.bak
 result ....................... updated - restart Claude Code
@@ -150,6 +153,16 @@ put this under `hooks` in the settings file of your choice:
             "type": "command",
             "if": "Bash(gh pr edit*)",
             "command": "python3 /path/to/claude_pr_resume_hook.py"
+          },
+          {
+            "type": "command",
+            "if": "Bash(gh pr comment*)",
+            "command": "python3 /path/to/claude_pr_resume_hook.py"
+          },
+          {
+            "type": "command",
+            "if": "Bash(gh pr review*)",
+            "command": "python3 /path/to/claude_pr_resume_hook.py"
           }
         ]
       }
@@ -168,13 +181,19 @@ up first.
 
 The hook reads the Claude Code hook event JSON from stdin:
 
-1. Ignores anything that isn't one of the two routes a PR can be opened by:
-   a `Bash` call running `gh pr create`/`gh pr edit`, or the GitHub MCP server's
-   `create_pull_request`/`update_pull_request`.
-2. Extracts the PR's `owner/repo/number` from the PR URL — printed to stdout by
-   `gh`, or returned in the MCP tool's JSON result. If there's no URL — the
-   command failed, `gh pr create --web` was used, or the MCP tool only asked for
-   confirmation — it does nothing.
+1. Ignores anything that isn't a session writing to a PR: a `Bash` call running
+   `gh pr create|edit|comment|review`, or one of the GitHub MCP server's
+   `create_pull_request`, `update_pull_request`, `add_issue_comment`,
+   `pull_request_review_write` or `add_reply_to_pull_request_comment`.
+2. Works out the PR's `owner/repo/number`:
+   - `gh pr create|edit` print the PR URL and `gh pr comment` the comment's URL,
+     which contains it. No URL — the command failed, or `--web` was used —
+     means it does nothing.
+   - `gh pr review` prints nothing outside a terminal, so the hook runs
+     `gh pr view <same selector> [--repo …]` in the session's directory to ask.
+   - The MCP tools return the URL, or name the PR in their input. A comment
+     through `add_issue_comment` counts only when its URL shows it landed on a
+     PR, not a plain issue; deleting a pending review doesn't count.
 3. Fetches the current PR body and takes the session's `cwd`/`session_id`
    from the hook event, authenticating to the GitHub REST API with a token
    from `$GH_TOKEN`/`$GITHUB_TOKEN`, falling back to `gh auth token`.
@@ -203,12 +222,12 @@ anyway. Correctness comes from the hook re-checking the command itself.
 
 ```json
 {
-  "matcher": "mcp__github__(create_pull_request|update_pull_request)",
+  "matcher": "mcp__github__(create_pull_request|update_pull_request|add_issue_comment|pull_request_review_write|add_reply_to_pull_request_comment)",
   "hooks": [{ "type": "command", "command": "/path/to/claude-pr-resume-hook" }]
 }
 ```
 
-The matcher needs no `if` filter — it already names the exact two tools. It does,
+The matcher needs no `if` filter — it already names the exact tools. It does,
 however, **assume your GitHub MCP server is keyed `github`**, which is the
 default but is yours to choose. If yours differs, or it comes from a plugin (those
 appear as `mcp__plugin_<plugin>_<server>__…`), edit that matcher by hand; the hook

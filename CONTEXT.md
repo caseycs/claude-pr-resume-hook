@@ -43,7 +43,8 @@ _Avoid_: binary, wrapper, entry point
 
 **Hook target**:
 One tool event the hook should fire on, as a matcher plus an optional filter —
-`gh pr create`, `gh pr edit`, or the GitHub MCP server's PR write tools. What
+`gh pr create`, `gh pr edit`, `gh pr comment`, `gh pr review`, or the GitHub
+MCP server's PR write tools (including comments and reviews). What
 `install` reconciles into settings, one entry per target.
 _Avoid_: trigger, rule, binding
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Claude Code PostToolUse hook: after `gh pr create` / `gh pr edit`, make sure
-the PR description ends with a line that lets you resume the Claude Code
-session that produced it.
+Claude Code PostToolUse hook: after a session opens, edits, comments on or
+reviews a pull request, make sure the PR description ends with a line that lets
+you resume the Claude Code session that touched it.
 
-Reads the Claude Code hook event JSON from stdin, and if it was a `gh pr
-create`/`gh pr edit` Bash call, appends (or replaces) a trailing footer:
+Reads the Claude Code hook event JSON from stdin, and if it was one of those
+calls - `gh pr create|edit|comment|review`, or the GitHub MCP server's matching
+tools - appends (or replaces) a trailing footer:
 
     ---
 
@@ -39,6 +40,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,7 +48,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(create|edit)\b")
+GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(create|edit|comment|review)\b")
 PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
 
 # The heading line of a footer, in any of its hand-edited guises. Tolerates the
@@ -109,21 +111,34 @@ TOOL_SOURCE = "git+https://github.com/caseycs/claude-pr-resume-hook"
 # Bash subcommands the hook fires on, turned into Claude Code `if` filters.
 # `if` is an optimisation, not a guarantee: it fails open when Claude Code
 # cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE.
-MATCHED_COMMANDS = ("gh pr create", "gh pr edit")
-# The GitHub MCP server's PR-writing tools. `install` pins the server key, since
+MATCHED_COMMANDS = ("gh pr create", "gh pr edit", "gh pr comment", "gh pr review")
+# `gh pr review` flags that take a value, so their value is not the PR selector.
+REVIEW_VALUE_FLAGS = ("-b", "--body", "-F", "--body-file", "-R", "--repo")
+# Where a shell command ends and the next begins, as shlex splits them.
+SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&", ";;", "(", ")"})
+# The GitHub MCP server's tools that write to a PR: open or edit it, comment on
+# it, review it, reply in a review thread. `install` pins the server key, since
 # it cannot know how yours is configured; the regex below stays tolerant so a
 # hand-widened matcher (a renamed server, or a plugin-bundled one named
 # `mcp__plugin_<plugin>_<server>__…`) still works.
 MCP_SERVER = "github"
-MCP_PR_TOOLS = ("create_pull_request", "update_pull_request")
+MCP_PR_TOOLS = (
+    "create_pull_request",
+    "update_pull_request",
+    "add_issue_comment",
+    "pull_request_review_write",
+    "add_reply_to_pull_request_comment",
+)
 MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_PR_TOOLS))
-MCP_PR_TOOL_RE = re.compile(r"^mcp__.+__(?:create|update)_pull_request$")
+MCP_PR_TOOL_RE = re.compile(r"^mcp__.+__(?P<tool>{})$".format("|".join(MCP_PR_TOOLS)))
 
 # Every settings entry install maintains: which tool event to match, how to
 # narrow it, and what to call it when reporting.
 HOOK_TARGETS = (
     {"matcher": "Bash", "if": "Bash(gh pr create*)", "label": "gh pr create"},
     {"matcher": "Bash", "if": "Bash(gh pr edit*)", "label": "gh pr edit"},
+    {"matcher": "Bash", "if": "Bash(gh pr comment*)", "label": "gh pr comment"},
+    {"matcher": "Bash", "if": "Bash(gh pr review*)", "label": "gh pr review"},
     {"matcher": MCP_MATCHER, "if": None, "label": "github mcp pull requests"},
 )
 # A hook entry whose command mentions any of these belongs to us, and is
@@ -380,29 +395,138 @@ def api_request(method, path, token, payload=None):
 
 
 def pr_from_bash(event):
-    """(owner, repo, number) for a `gh pr create`/`gh pr edit` call, or None."""
+    """(owner, repo, number) for a `gh pr create|edit|comment|review` call, or None."""
     command = event.get("tool_input", {}).get("command", "")
-    if not GH_PR_COMMAND_RE.search(command):
+    found = GH_PR_COMMAND_RE.search(command)
+    if not found:
         return None
     response = event.get("tool_response")
     stdout = response.get("stdout") if isinstance(response, dict) else None
+    # create and edit print the PR URL, comment prints the comment's URL - which
+    # is the PR URL plus an anchor. No URL means the command failed, or was `--web`.
     match = PR_URL_RE.search(stdout or "")
-    # No URL means gh printed none - the command failed, or was `--web`.
+    if match:
+        return match.groups()
+    if found.group(1) == "review":
+        # gh pr review prints nothing when stdout isn't a terminal, which under
+        # Claude Code it never is, so ask gh which PR the command meant.
+        return pr_from_review_command(command[found.start():], event.get("cwd"))
+    return None
+
+
+def review_args(command):
+    """The arguments of the `gh pr review` that starts `command`, up to the next shell operator."""
+    for text in (command, command.split("\n", 1)[0]):
+        try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+            lexer.whitespace_split = True
+            tokens = list(lexer)
+            break
+        except ValueError:
+            # Unbalanced quoting, typically a heredoc body; the selector and
+            # --repo are on the first line in practice.
+            continue
+    else:
+        return []
+    args = []
+    for token in tokens[3:]:
+        if token in SHELL_OPERATORS:
+            break
+        args.append(token)
+    return args
+
+
+def pr_from_review_command(command, cwd):
+    """(owner, repo, number) for the PR a `gh pr review` command named, via `gh pr view`."""
+    selector = repo = None
+    args = iter(review_args(command))
+    for arg in args:
+        if arg in ("-R", "--repo"):
+            repo = next(args, None)
+        elif arg.startswith("--repo="):
+            repo = arg.split("=", 1)[1]
+        elif arg in REVIEW_VALUE_FLAGS:
+            next(args, None)
+        elif arg.startswith("-"):
+            continue
+        elif selector is None:
+            selector = arg
+    view = ["gh", "pr", "view"]
+    if selector:
+        view.append(selector)
+    if repo:
+        view += ["--repo", repo]
+    view += ["--json", "url", "--jq", ".url"]
+    try:
+        out = subprocess.run(
+            view, cwd=cwd or None, capture_output=True, text=True, timeout=15, check=True
+        )
+    except Exception:
+        return None
+    match = PR_URL_RE.search(out.stdout)
     return match.groups() if match else None
 
 
-def pr_from_mcp(event):
-    """(owner, repo, number) for a GitHub MCP PR create/update call, or None."""
-    # The server returns a text result holding JSON like
-    # {"id": "...", "url": "https://github.com/owner/repo/pull/1"}. Serialize the
-    # whole response rather than reaching into it: how Claude Code nests MCP
-    # content is undocumented, and this works for a text block, a list of blocks,
-    # a bare string or a dict alike. Note `id` is GitHub's database id, not the
-    # PR number, so the URL is the only usable source.
+def pr_from_input(tool_input, number_key="pullNumber"):
+    """(owner, repo, number) from an MCP tool's named input fields, or None."""
+    if not isinstance(tool_input, dict):
+        return None
+    owner, repo, number = (
+        tool_input.get("owner"),
+        tool_input.get("repo"),
+        tool_input.get(number_key),
+    )
+    if not owner or not repo or not isinstance(number, (int, float)):
+        return None
+    return str(owner), str(repo), str(int(number))
+
+
+def pr_from_mcp(event, tool):
+    """(owner, repo, number) for a GitHub MCP PR write, or None."""
+    tool_input = event.get("tool_input")
+    # Serialize the whole response rather than reaching into it: how Claude Code
+    # nests MCP content is undocumented, and this works for a text block, a list
+    # of blocks, a bare string or a dict alike.
     try:
         blob = json.dumps(event.get("tool_response"))
     except (TypeError, ValueError):
         blob = ""
+
+    if tool == "add_issue_comment":
+        # Also used on plain issues, which must be left alone. The comment URL
+        # says which it was: github.com/o/r/pull/N#issuecomment-… only for a PR.
+        # Checked against the input rather than searched for, since an older
+        # server echoes the comment body, which may link to other PRs.
+        target = pr_from_input(tool_input, "issue_number")
+        if not target:
+            return None
+        owner, repo, number = target
+        on_pr = re.search(
+            r"https://github\.com/{}/{}/pull/{}#issuecomment-".format(
+                re.escape(owner), re.escape(repo), number
+            ),
+            blob,
+            re.IGNORECASE,
+        )
+        return target if on_pr else None
+
+    if tool == "pull_request_review_write":
+        # Returns only a status sentence; the input names the PR. Throwing away a
+        # pending review leaves nothing on the PR to point back from.
+        if isinstance(tool_input, dict) and tool_input.get("method") == "delete_pending":
+            return None
+        return pr_from_input(tool_input)
+
+    if tool == "add_reply_to_pull_request_comment":
+        target = pr_from_input(tool_input)
+        if target:
+            return target
+        match = re.search(r"https://github\.com/([^/\s\"]+)/([^/\s\"]+)/pull/(\d+)#discussion_r", blob)
+        return match.groups() if match else None
+
+    # create/update_pull_request return JSON like
+    # {"id": "...", "url": "https://github.com/owner/repo/pull/1"}. Note `id` is
+    # GitHub's database id, not the PR number, so the URL is the only usable source.
     match = PR_URL_RE.search(blob)
     if match:
         return match.groups()
@@ -411,27 +535,20 @@ def pr_from_mcp(event):
     # fields if a future server version stops returning the URL. Read them by
     # name only - never regex tool_input, because a PR body legitimately contains
     # other PRs' URLs ("closes .../pull/5") and we would patch the wrong one.
-    tool_input = event.get("tool_input")
-    if not isinstance(tool_input, dict):
-        return None
-    owner, repo, number = (
-        tool_input.get("owner"),
-        tool_input.get("repo"),
-        tool_input.get("pullNumber"),
-    )
-    if not owner or not repo or not isinstance(number, (int, float)):
-        return None
-    return str(owner), str(repo), str(int(number))
+    if tool == "update_pull_request":
+        return pr_from_input(tool_input)
+    return None
 
 
 def run_hook():
     event = json.load(sys.stdin)
 
     tool_name = event.get("tool_name") or ""
+    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
     if tool_name == "Bash":
         target = pr_from_bash(event)
-    elif MCP_PR_TOOL_RE.match(tool_name):
-        target = pr_from_mcp(event)
+    elif mcp_tool:
+        target = pr_from_mcp(event, mcp_tool.group("tool"))
     else:
         return 0
 
@@ -758,7 +875,8 @@ def build_parser():
         prog=CONSOLE_SCRIPT,
         description=(
             "Claude Code PostToolUse hook that appends a resume-session footer to "
-            "gh PR descriptions. With no arguments, reads a hook event on stdin."
+            "the descriptions of PRs a session opens, edits, comments on or reviews. "
+            "With no arguments, reads a hook event on stdin."
         ),
     )
     sub = parser.add_subparsers(dest="subcommand")

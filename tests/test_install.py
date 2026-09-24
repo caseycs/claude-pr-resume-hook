@@ -36,7 +36,7 @@ def test_writes_the_absolute_resolved_shim_path(home, shim, monkeypatch):
     assert install(monkeypatch) == 0
 
     entries = our_entries(read(home / ".claude/settings.json"))
-    assert [e["command"] for e in entries] == [shim, shim, shim]
+    assert [e["command"] for e in entries] == [shim] * len(hook.HOOK_TARGETS)
     assert entries[0]["command"].startswith("/")
 
 
@@ -82,10 +82,13 @@ def test_creates_user_settings_from_scratch(home, shim, monkeypatch):
 
     bash, mcp = groups
     assert bash["matcher"] == "Bash"
-    assert [e["if"] for e in bash["hooks"]] == ["Bash(gh pr create*)", "Bash(gh pr edit*)"]
+    assert [e["if"] for e in bash["hooks"]] == ["Bash(gh pr create*)", "Bash(gh pr edit*)", "Bash(gh pr comment*)", "Bash(gh pr review*)"]
 
     # The MCP tools are narrowed by matcher, so they need no `if` filter.
-    assert mcp["matcher"] == "mcp__github__(create_pull_request|update_pull_request)"
+    assert mcp["matcher"] == (
+        "mcp__github__(create_pull_request|update_pull_request|add_issue_comment"
+        "|pull_request_review_write|add_reply_to_pull_request_comment)"
+    )
     assert len(mcp["hooks"]) == 1
     assert "if" not in mcp["hooks"][0]
 
@@ -104,7 +107,7 @@ def test_each_scope_writes_its_own_file(home, shim, monkeypatch, tmp_path, scope
     install(monkeypatch, "--scope", scope)
 
     expected = home / ".claude/settings.json" if relative is None else tmp_path / "project" / relative
-    assert len(our_entries(read(expected))) == 3
+    assert len(our_entries(read(expected))) == len(hook.HOOK_TARGETS)
 
 
 def test_unknown_scope_is_rejected(home, shim, monkeypatch):
@@ -121,7 +124,7 @@ def test_user_scope_honors_claude_config_dir(home, shim, monkeypatch, tmp_path):
 
     install(monkeypatch)
 
-    assert len(our_entries(read(config_dir / "settings.json"))) == 3
+    assert len(our_entries(read(config_dir / "settings.json"))) == len(hook.HOOK_TARGETS)
     assert not (home / ".claude" / "settings.json").exists()
 
 
@@ -200,7 +203,7 @@ def test_updates_a_stale_path_and_reports_the_change(home, shim, monkeypatch, ca
     assert old in out
     assert shim in out
     entries = our_entries(read(path))
-    assert [e["command"] for e in entries] == [shim, shim, shim]
+    assert [e["command"] for e in entries] == [shim] * len(hook.HOOK_TARGETS)
 
 
 def test_removes_legacy_entries_that_do_not_match_our_filters(home, shim, monkeypatch, capsys):
@@ -215,7 +218,7 @@ def test_removes_legacy_entries_that_do_not_match_our_filters(home, shim, monkey
 
     assert "2 removed" in capsys.readouterr().out
     entries = our_entries(read(path))
-    assert len(entries) == 3
+    assert len(entries) == len(hook.HOOK_TARGETS)
     assert all(e["command"] == shim for e in entries)
 
 
@@ -226,7 +229,7 @@ def test_installing_twice_does_not_duplicate(home, shim, monkeypatch):
 
     second = read(home / ".claude/settings.json")
     assert first == second
-    assert len(our_entries(second)) == 3
+    assert len(our_entries(second)) == len(hook.HOOK_TARGETS)
 
 
 def test_reinstall_after_the_shim_moves_rewrites_the_path(home, shim, monkeypatch, tmp_path):
@@ -242,7 +245,7 @@ def test_reinstall_after_the_shim_moves_rewrites_the_path(home, shim, monkeypatc
     install(monkeypatch)
 
     entries = our_entries(read(home / ".claude/settings.json"))
-    assert [e["command"] for e in entries] == [str(exe.resolve())] * 3
+    assert [e["command"] for e in entries] == [str(exe.resolve())] * len(hook.HOOK_TARGETS)
 
 
 # --- merging into existing settings ------------------------------------------
@@ -267,7 +270,7 @@ def test_unrelated_settings_are_preserved(home, shim, monkeypatch):
     assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"] == "echo pre"
     write_group = next(g for g in settings["hooks"]["PostToolUse"] if g["matcher"] == "Write")
     assert write_group["hooks"][0]["command"] == "echo fmt"
-    assert len(our_entries(settings)) == 3
+    assert len(our_entries(settings)) == len(hook.HOOK_TARGETS)
 
 
 def test_joins_an_existing_bash_matcher_group(home, shim, monkeypatch):
@@ -281,7 +284,7 @@ def test_joins_an_existing_bash_matcher_group(home, shim, monkeypatch):
     groups = read(path)["hooks"]["PostToolUse"]
     assert [g["matcher"] for g in groups] == ["Bash", hook.MCP_MATCHER]
     assert groups[0]["hooks"][0]["command"] == "echo other"
-    assert len(groups[0]["hooks"]) == 3
+    assert len(groups[0]["hooks"]) == len(hook.HOOK_TARGETS)
     assert len(groups[1]["hooks"]) == 1
 
 
@@ -371,3 +374,24 @@ def test_malformed_hooks_object_aborts(home, shim, monkeypatch):
 
     with pytest.raises(SystemExit, match="not an object"):
         install(monkeypatch)
+
+
+def test_upgrading_adds_the_comment_and_review_targets(home, shim, monkeypatch, capsys):
+    """An install from before comment support gains the new entries on re-run."""
+    path = home / ".claude/settings.json"
+    seed(path, {"hooks": {"PostToolUse": [
+        {"matcher": "Bash", "hooks": [
+            {"type": "command", "if": "Bash(gh pr create*)", "command": shim},
+            {"type": "command", "if": "Bash(gh pr edit*)", "command": shim},
+        ]},
+        {"matcher": "mcp__github__(create_pull_request|update_pull_request)",
+         "hooks": [{"type": "command", "command": shim}]},
+    ]}})
+
+    install(monkeypatch)
+
+    out = capsys.readouterr().out
+    assert "gh pr comment" in out and "gh pr review" in out
+    groups = read(path)["hooks"]["PostToolUse"]
+    assert [g["matcher"] for g in groups] == ["Bash", hook.MCP_MATCHER]
+    assert len(our_entries(read(path))) == len(hook.HOOK_TARGETS)
