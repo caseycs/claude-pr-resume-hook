@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.2.1...v0.3.0) (2026-09-24)
+
+
+### Features
+
+* include the session name in the footer summary ([d736f80](https://github.com/caseycs/claude-pr-resume-hook/commit/d736f80156f47979451a540be37b8a91fd853009))
+* one footer per session, stamped with time and model/effort ([a9565f9](https://github.com/caseycs/claude-pr-resume-hook/commit/a9565f9a1b9dd30e8b8a1bd6fee65fa40d3fe1e9))
+* one footer per session, stamped with time and model/effort ([6851ed1](https://github.com/caseycs/claude-pr-resume-hook/commit/6851ed1c2c88770dede44024c14abce5f4f5393e))
+
 ## [0.2.1](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.2.0...v0.2.1) (2026-08-07)
 
 
