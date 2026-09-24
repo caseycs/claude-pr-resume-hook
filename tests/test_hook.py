@@ -435,7 +435,7 @@ def test_other_server_keys_are_still_handled(run_event, api, tool_name):
     [
         pytest.param("mcp__github__search_code", id="unrelated-github-tool"),
         pytest.param("mcp__github__pull_request_read", id="read-only-pr-tool"),
-        pytest.param("mcp__github__add_issue_comment", id="comment-tool"),
+        pytest.param("mcp__github__add_comment_to_pending_review", id="pending-comment"),
         pytest.param("mcp__memory__create_entities", id="unrelated-server"),
     ],
 )
@@ -527,3 +527,169 @@ def test_token_is_none_when_gh_is_unavailable(monkeypatch):
 
 def _explode(*args, **kwargs):
     raise OSError("gh not found")
+
+
+# --- comments and reviews ----------------------------------------------------
+
+
+def test_gh_pr_comment_refreshes_the_description(run_event, event, api):
+    api.body = "Some description."
+
+    run_event(event(
+        tool_input={"command": "gh pr comment 5 --body 'LGTM'"},
+        tool_response={"stdout": "https://github.com/o/r/pull/5#issuecomment-2891234567\n"},
+    ))
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/5"), ("PATCH", "/repos/o/r/pulls/5")]
+    assert api.patches[0]["body"] == f"Some description.\n\n---\n\n{FOOTER}\n"
+
+
+def test_gh_pr_comment_without_a_url_does_nothing(run_event, event, api):
+    """`--web` opens a browser and prints no URL: nothing was posted yet."""
+    run_event(event(tool_input={"command": "gh pr comment 5 --web"}, tool_response={"stdout": ""}))
+    assert api.calls == []
+
+
+@pytest.fixture
+def gh_view(monkeypatch):
+    """Stub `gh pr view`, recording how it was called."""
+
+    class GhView:
+        calls = []
+        url = "https://github.com/o/r/pull/12\n"
+        fail = False
+
+    def fake_run(argv, **kwargs):
+        GhView.calls.append((argv, kwargs.get("cwd")))
+        if GhView.fail:
+            raise hook.subprocess.CalledProcessError(1, argv)
+        return hook.subprocess.CompletedProcess(argv, 0, stdout=GhView.url, stderr="")
+
+    monkeypatch.setattr(hook.subprocess, "run", fake_run)
+    return GhView
+
+
+def review(command):
+    """A `gh pr review` event: gh prints nothing when stdout isn't a terminal."""
+    return {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_response": {"stdout": "", "stderr": ""},
+        "cwd": "/work/tree",
+        "session_id": "sess-abc",
+    }
+
+
+def test_gh_pr_review_asks_gh_which_pr_it_was(run_event, api, gh_view):
+    run_event(review("gh pr review 12 --approve"))
+
+    assert gh_view.calls == [
+        (["gh", "pr", "view", "12", "--json", "url", "--jq", ".url"], "/work/tree")
+    ]
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/12"), ("PATCH", "/repos/o/r/pulls/12")]
+
+
+@pytest.mark.parametrize(
+    "command,expected",
+    [
+        pytest.param("gh pr review --comment -b 'nit: 42'",
+                     ["gh", "pr", "view"], id="current-branch"),
+        pytest.param("gh pr review -R o/r 12 -r --body 'see 99'",
+                     ["gh", "pr", "view", "12", "--repo", "o/r"], id="repo-flag"),
+        pytest.param("gh pr review --repo=o/r --body-file notes.md feature-x --approve",
+                     ["gh", "pr", "view", "feature-x", "--repo", "o/r"], id="equals-and-branch"),
+        pytest.param("gh pr review 12 --approve && gh pr merge 13",
+                     ["gh", "pr", "view", "12"], id="stops-at-operator"),
+        pytest.param("cd /x && gh pr review 12 -c -b \"$(cat <<'EOF'\nit's fine\nEOF\n)\"",
+                     ["gh", "pr", "view", "12"], id="heredoc-body"),
+    ],
+)
+def test_the_review_selector_is_read_from_the_command(run_event, api, gh_view, command, expected):
+    run_event(review(command))
+
+    assert gh_view.calls[0][0] == expected + ["--json", "url", "--jq", ".url"]
+
+
+def test_a_review_gh_cannot_resolve_does_nothing(run_event, api, gh_view):
+    gh_view.fail = True
+
+    assert run_event(review("gh pr review 12 --approve")) == 0
+
+    assert api.calls == []
+
+
+def test_mcp_pr_comment_refreshes_the_description(run_event, api):
+    event = mcp_event(
+        "add_issue_comment",
+        response={"type": "text", "text": '{"id":"1","url":"https://github.com/o/r/pull/5#issuecomment-1"}'},
+        tool_input={"owner": "o", "repo": "r", "issue_number": 5, "body": "LGTM"},
+    )
+
+    run_event(event)
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/5"), ("PATCH", "/repos/o/r/pulls/5")]
+
+
+def test_mcp_comment_on_a_plain_issue_touches_nothing(run_event, api):
+    event = mcp_event(
+        "add_issue_comment",
+        response={"type": "text", "text": '{"id":"1","url":"https://github.com/o/r/issues/5#issuecomment-1"}'},
+        tool_input={"owner": "o", "repo": "r", "issue_number": 5, "body": "see o/r/pull/7"},
+    )
+
+    assert run_event(event) == 0
+
+    assert api.calls == []
+
+
+def test_mcp_issue_comment_linking_a_pr_touches_nothing(run_event, api):
+    """An older server echoes the comment body; a PR linked in it is not the target."""
+    body = "Duplicate of https://github.com/o/r/pull/7#issuecomment-9"
+    event = mcp_event(
+        "add_issue_comment",
+        response={"type": "text", "text": json.dumps({
+            "html_url": "https://github.com/o/r/issues/5#issuecomment-1", "body": body,
+        })},
+        tool_input={"owner": "o", "repo": "r", "issue_number": 5, "body": body},
+    )
+
+    assert run_event(event) == 0
+
+    assert api.calls == []
+
+
+@pytest.mark.parametrize("method", ["create", "submit_pending"])
+def test_mcp_review_refreshes_the_description(run_event, api, method):
+    event = mcp_event(
+        "pull_request_review_write",
+        response={"type": "text", "text": "pull request review submitted successfully"},
+        tool_input={"method": method, "owner": "o", "repo": "r", "pullNumber": 12, "event": "APPROVE"},
+    )
+
+    run_event(event)
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/12"), ("PATCH", "/repos/o/r/pulls/12")]
+
+
+def test_mcp_deleting_a_pending_review_touches_nothing(run_event, api):
+    event = mcp_event(
+        "pull_request_review_write",
+        response={"type": "text", "text": "pending pull request review successfully deleted"},
+        tool_input={"method": "delete_pending", "owner": "o", "repo": "r", "pullNumber": 12},
+    )
+
+    assert run_event(event) == 0
+
+    assert api.calls == []
+
+
+def test_mcp_review_thread_reply_refreshes_the_description(run_event, api):
+    event = mcp_event(
+        "add_reply_to_pull_request_comment",
+        response={"type": "text", "text": '{"id":"3","url":"https://github.com/o/r/pull/12#discussion_r3"}'},
+        tool_input={"owner": "o", "repo": "r", "pullNumber": 12, "commentId": 99, "body": "done"},
+    )
+
+    run_event(event)
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/12"), ("PATCH", "/repos/o/r/pulls/12")]
