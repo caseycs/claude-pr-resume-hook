@@ -52,5 +52,15 @@ the attribute when rendering; it lives only in the raw body. Blocks from 0.3.x
 fall back to the summary's date, zone ignored — close enough to order them.
 Blocks with no date at all sort first, keeping their relative order.
 
+## Identifying our blocks
+
+Every block also carries `data-generator="caseycs/claude-pr-resume-hook"`. A
+block matching the summary pattern but naming a different generator is left in
+the prose untouched. That matters now that blocks are restored and reordered:
+the hook should only ever move what it wrote. Blocks from before the attribute
+existed have no generator at all, and are still treated as ours. The attribute
+is `data-generator`, not `author`, because "author" is reserved vocabulary (see
+CONTEXT.md — it means the PR's opener, which is not the footer owner).
+
 This replaces 0008's "update in place, append new sessions": a returning session
 now moves to the bottom.

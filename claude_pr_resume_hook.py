@@ -10,7 +10,7 @@ tools - appends (or replaces) a trailing footer:
 
     ---
 
-    <details data-updated="2026-09-24T09:28:00+02:00">
+    <details data-generator="caseycs/claude-pr-resume-hook" data-updated="2026-09-24T09:28:00+02:00">
     <summary>AI session - your-github-login (session name), 24 September 2026 09:28 CEST, Opus5.5/high</summary>
 
     ```
@@ -86,13 +86,18 @@ INLINE_FOOTER_RE = re.compile(
 # model. One per user and session - see docs/adr/0006 and 0008. Logins never
 # contain commas or parentheses, so the login ends at the first of either.
 FOOTER_DETAILS_RE = re.compile(
-    r"[ \t]*<details(?:[ \t][^>\n]*)?>[ \t]*\n"
+    r"[ \t]*<details(?P<attrs>(?:[ \t][^>\n]*)?)>[ \t]*\n"
     r"[ \t]*<summary>[ \t]*AI session[ \t]*-[ \t]*(?P<user>[^<\n,(]*?)[ \t]*"
     r"(?:[,(][^<\n]*)?</summary>"
     r".*?"
     r"</details>[ \t]*",
     re.DOTALL | re.IGNORECASE,
 )
+# Every block this tool writes names it, so it can tell its own blocks from a
+# look-alike written by something else. Blocks from before 0.4 carry no
+# generator at all and still count as ours.
+FOOTER_GENERATOR = "caseycs/claude-pr-resume-hook"
+GENERATOR_ATTR_RE = re.compile(r'\bdata-generator="([^"]*)"', re.IGNORECASE)
 # When a footer was last written, machine-readable, for ordering blocks. Blocks
 # from before it existed fall back to the date in their summary.
 FOOTER_UPDATED_RE = re.compile(r'<details[^>\n]*\bdata-updated="([^"]+)"', re.IGNORECASE)
@@ -308,7 +313,10 @@ def session_stamp(when=None, model=None, effort=None, name=None):
 
 def footer_for(cwd, session_id, user, stamp="", updated=None):
     command = f"cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}"
-    attrs = f' data-updated="{updated.isoformat(timespec="seconds")}"' if updated else ""
+    attrs = f' data-generator="{FOOTER_GENERATOR}"'
+    if updated:
+        attrs += f' data-updated="{updated.isoformat(timespec="seconds")}"'
+
     return (
         f"<details{attrs}>\n"
         f"<summary>AI session - {user}{stamp}</summary>\n"
@@ -333,12 +341,15 @@ def strip_legacy_footers(body):
 def split_footers(body):
     """Separate a body into (prose, [(user, session, footer_text), ...]).
 
-    Footers are lifted out in the order they appear, so rewriting one leaves
-    every other session's block exactly where its owner put it.
+    Footers are lifted out in the order they appear. A look-alike block naming
+    a different generator isn't ours, and stays in the prose untouched.
     """
     footers = []
 
     def lift(match):
+        generator = GENERATOR_ATTR_RE.search(match.group("attrs"))
+        if generator and generator.group(1) != FOOTER_GENERATOR:
+            return match.group(0)
         session = FOOTER_SESSION_RE.search(match.group(0))
         footers.append((
             match.group("user").strip(),

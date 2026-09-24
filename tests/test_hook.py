@@ -8,7 +8,7 @@ import pytest
 import claude_pr_resume_hook as hook
 
 FOOTER = (
-    '<details data-updated="2026-09-12T14:05:00+00:00">\n'
+    '<details data-generator="caseycs/claude-pr-resume-hook" data-updated="2026-09-12T14:05:00+00:00">\n'
     "<summary>AI session - tester, 12 September 2026 14:05 UTC</summary>\n"
     "\n"
     "```\ncd /work/tree; claude -r sess-abc\n```\n"

@@ -41,7 +41,7 @@ def test_footer_is_a_collapsed_details_block():
         "\n"
         "---\n"
         "\n"
-        "<details>\n"
+        '<details data-generator="caseycs/claude-pr-resume-hook">\n'
         "<summary>AI session - tester</summary>\n"
         "\n"
         "```\n"
@@ -55,7 +55,7 @@ def test_footer_is_a_collapsed_details_block():
 def test_blank_lines_inside_details_keep_the_fence_rendering():
     """GitHub only renders markdown inside <details> when blank lines separate it."""
     block = footer()
-    assert block.startswith("<details>\n<summary>")
+    assert block.startswith('<details data-generator="caseycs/claude-pr-resume-hook">\n<summary>')
     assert "</summary>\n\n```" in block
     assert "```\n\n</details>" in block
 
@@ -121,7 +121,10 @@ def test_a_returning_session_is_rewritten_and_moves_to_the_bottom():
 
 def test_the_block_records_when_it_was_written():
     block = hook.footer_for("/w", "s1", "u", updated=at(2, 8))
-    assert block.startswith('<details data-updated="2026-09-02T08:00:00+00:00">\n<summary>')
+    assert block.startswith(
+        '<details data-generator="caseycs/claude-pr-resume-hook"'
+        ' data-updated="2026-09-02T08:00:00+00:00">\n<summary>'
+    )
 
 
 def test_blocks_are_ordered_oldest_first_whatever_their_zone():
@@ -403,8 +406,9 @@ def test_shell_metacharacters_are_backslash_escaped(at_home, cwd, expected):
 
 def test_escaping_leaves_the_tilde_and_slashes_bare(at_home):
     block = hook.footer_for("/Users/someone/my repo", "s1", "u")
-    assert "cd ~/" in block
-    assert "'" not in block and '"' not in block
+    command = next(line for line in block.splitlines() if line.startswith("cd "))
+    assert command.startswith("cd ~/")
+    assert "'" not in command and '"' not in command
 
 
 # --- summary stamp -----------------------------------------------------------
@@ -454,3 +458,27 @@ def test_stamp_leads_with_the_session_name():
 )
 def test_session_name_is_one_safe_line(name, expected):
     assert hook.session_name(name) == expected
+
+
+# --- generator --------------------------------------------------------------
+
+
+def test_a_look_alike_from_another_tool_is_left_alone():
+    theirs = (
+        '<details data-generator="someone/other-tool">\n'
+        "<summary>AI session - tester</summary>\n\n```\ncd /x; claude -r sess-abc\n```\n\n</details>"
+    )
+    body = f"Body.\n\n{theirs}"
+
+    result = build(body)
+
+    assert theirs in result
+    assert users_in(result.replace(theirs, "")) == ["tester"]
+
+
+def test_a_block_from_before_the_generator_still_counts_as_ours():
+    old = "<details>\n<summary>AI session - tester</summary>\n\n```\ncd /old; claude -r sess-abc\n```\n\n</details>"
+
+    result = build(f"Body.\n\n---\n\n{old}\n")
+
+    assert result == build("Body.")

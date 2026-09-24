@@ -258,9 +258,19 @@ The footer is rewritten to stay correct rather than accumulating:
 | blocks you deleted by hand | stay deleted, except this session's own |
 | footer from an earlier version's format | migrated to a `<details>` block |
 
-Blocks are ordered by when they were last written, oldest first. Each carries
-the time machine-readably in `<details data-updated="…">`, with its zone, so
-blocks written from different time zones sort correctly. Blocks from 0.3.x,
+Each block's tag identifies it and its time, both hidden when GitHub renders
+the page:
+
+```html
+<details data-generator="caseycs/claude-pr-resume-hook" data-updated="2026-09-12T14:05:00+02:00">
+```
+
+A look-alike block naming a different `data-generator` is never touched; blocks
+from before 0.4, which carry none, still count as this tool's.
+
+Blocks are ordered by when they were last written, oldest first. `data-updated`
+carries a numeric offset, so blocks written from different time zones sort
+correctly. Blocks from 0.3.x,
 which lack it, are dated from their summary; older ones without a date go
 first. Matching is case-insensitive, since GitHub logins are. An unrelated
 `<details>`, fenced code block, or horizontal rule elsewhere in the body is left
