@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.3.0...v0.4.0) (2026-09-24)
+
+
+### Features
+
+* mark footer blocks with data-generator ([61ad206](https://github.com/caseycs/claude-pr-resume-hook/commit/61ad206d9e9096f03a489f0974a9708c4cfe236b))
+* refresh the footer when a session comments on or reviews a PR ([627a8d7](https://github.com/caseycs/claude-pr-resume-hook/commit/627a8d7901d625b1ed4a1a703d79a46918d3ec7d))
+* refresh the footer when a session comments on or reviews a PR ([2361619](https://github.com/caseycs/claude-pr-resume-hook/commit/23616198e00bcd0655c35435e5930e18c89f0dcb))
+* restore footers dropped by a description rewrite, order blocks by time ([d5f8701](https://github.com/caseycs/claude-pr-resume-hook/commit/d5f8701e241707064cf41fc1b20e0fc9edb4f168))
+* restore footers dropped by a description rewrite, order blocks by time ([d45d07e](https://github.com/caseycs/claude-pr-resume-hook/commit/d45d07e3308c08f88d50aff643c48f2cea3131e8))
+
 ## [0.3.0](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.2.1...v0.3.0) (2026-09-24)
 
 
