@@ -8,7 +8,7 @@ import pytest
 import claude_pr_resume_hook as hook
 
 FOOTER = (
-    "<details>\n"
+    '<details data-updated="2026-09-12T14:05:00+00:00">\n'
     "<summary>AI session - tester, 12 September 2026 14:05 UTC</summary>\n"
     "\n"
     "```\ncd /work/tree; claude -r sess-abc\n```\n"
@@ -177,7 +177,7 @@ def test_the_same_session_later_only_moves_the_timestamp(run_event, event, api, 
 
     assert api.patches[0]["body"] == api.body.replace(
         "12 September 2026 14:05", "14 September 2026 15:05"
-    )
+    ).replace("2026-09-12T14:05", "2026-09-14T15:05")
 
 
 # --- when and on what model --------------------------------------------------
@@ -693,3 +693,110 @@ def test_mcp_review_thread_reply_refreshes_the_description(run_event, api):
     run_event(event)
 
     assert api.pr_calls == [("GET", "/repos/o/r/pulls/12"), ("PATCH", "/repos/o/r/pulls/12")]
+
+
+# --- recovering footers an edit dropped ---------------------------------------
+
+THEIRS = (
+    '<details data-updated="2026-09-10T09:00:00+00:00">\n'
+    "<summary>AI session - alice, 10 September 2026 09:00 UTC</summary>\n\n"
+    "```\ncd /a; claude -r sess-alice\n```\n\n</details>"
+)
+JUST_NOW = "2026-09-12T14:04:30Z"
+
+
+def edit_event(event, command="gh pr edit 123 --body-file body.md"):
+    return event(
+        tool_input={"command": command},
+        tool_response={"stdout": "https://github.com/owner/repo/pull/123\n"},
+    )
+
+
+def test_a_rewritten_description_gets_dropped_footers_back(run_event, event, api):
+    before = f"Old description.\n\n---\n\n{THEIRS}\n"
+    api.body = "Rewritten from scratch."
+    api.edits = [("2026-09-10T09:00:00Z", before), (JUST_NOW, api.body)]
+
+    run_event(edit_event(event))
+
+    assert api.history_calls[0]["variables"] == {"owner": "owner", "repo": "repo", "number": 123}
+    assert api.patches[0]["body"] == f"Rewritten from scratch.\n\n---\n\n{THEIRS}\n\n{FOOTER}\n"
+
+
+def test_mcp_body_update_also_recovers(run_event, api):
+    api.body = "Rewritten from scratch."
+    api.edits = [("2026-09-10T09:00:00Z", f"Old.\n\n---\n\n{THEIRS}\n"), (JUST_NOW, api.body)]
+    event = mcp_event(
+        "update_pull_request",
+        tool_input={"owner": "o", "repo": "r", "pullNumber": 9, "body": "Rewritten from scratch."},
+    )
+
+    run_event(event)
+
+    assert users_in(api.patches[0]["body"]) == ["alice", "tester"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("gh pr edit 123 --title 'Better title'", id="title-only-edit"),
+        pytest.param("gh pr edit 123 --add-label bug", id="label-edit"),
+    ],
+)
+def test_edits_that_leave_the_description_alone_skip_history(run_event, event, api, command):
+    api.edits = [("2026-09-10T09:00:00Z", f"Old.\n\n---\n\n{THEIRS}\n"), (JUST_NOW, "Body.")]
+
+    run_event(edit_event(event, command))
+
+    assert api.history_calls == []
+
+
+def test_comments_and_creates_skip_history(run_event, event, api):
+    run_event(event())
+    run_event(event(
+        tool_input={"command": "gh pr comment 123 -b hi"},
+        tool_response={"stdout": "https://github.com/owner/repo/pull/123#issuecomment-1\n"},
+    ))
+
+    assert api.history_calls == []
+
+
+def test_an_old_edit_is_not_trusted(run_event, event, api):
+    """A person removing a block yesterday must not see it come back today."""
+    api.body = "Body without alice."
+    api.edits = [
+        ("2026-09-10T09:00:00Z", f"Body.\n\n---\n\n{THEIRS}\n"),
+        ("2026-09-11T09:00:00Z", api.body),
+    ]
+
+    run_event(edit_event(event))
+
+    assert users_in(api.patches[0]["body"]) == ["tester"]
+
+
+def test_history_that_does_not_end_at_the_current_body_is_not_trusted(run_event, event, api):
+    api.body = "What is on GitHub now."
+    api.edits = [("2026-09-10T09:00:00Z", f"Old.\n\n---\n\n{THEIRS}\n"), (JUST_NOW, "Something else.")]
+
+    run_event(edit_event(event))
+
+    assert users_in(api.patches[0]["body"]) == ["tester"]
+
+
+def test_a_failed_history_lookup_still_writes_the_footer(run_event, event, api, capsys):
+    api.body = "Body."
+    api.edits_error = urllib.error.HTTPError("/graphql", 502, "Bad Gateway", {}, None)
+
+    assert run_event(edit_event(event)) == 0
+
+    assert users_in(api.patches[0]["body"]) == ["tester"]
+    assert "edit history" in capsys.readouterr().err
+
+
+def test_a_description_never_edited_before_has_nothing_to_recover(run_event, event, api):
+    api.body = "Body."
+    api.edits = [(JUST_NOW, "Body.")]
+
+    run_event(edit_event(event))
+
+    assert api.patches[0]["body"] == f"Body.\n\n---\n\n{FOOTER}\n"
