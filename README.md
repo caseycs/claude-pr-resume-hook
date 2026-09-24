@@ -8,7 +8,7 @@ that lets you jump straight back into that session later:
 > ---
 >
 > <details>
-> <summary>AI session - caseycs</summary>
+> <summary>AI session - caseycs, 12 September 2026 14:05 CEST, Fable5.5/high</summary>
 >
 > ```
 > cd ~/github/my-repo; claude -r 85b3ce92-2e7b-432b-bf68-8ca769a1ad8a
@@ -27,10 +27,11 @@ that lets you jump straight back into that session later:
   you run Claude under more than one `$HOME` to keep contexts separate: the `cd`
   puts you in the right one rather than resuming against whichever context
   happens to be current.
-- **One block per person.** The summary names the **GitHub login** whose session
-  it is. A colleague working the same PR from their own session gets a block
-  alongside yours; each run only ever adds or updates its own, never touching
-  anyone else's. Collapsed by default, so several stay out of the way.
+- **One block per session.** The summary names the **GitHub login** whose session
+  it is, when it last touched the PR, and the model/effort it ran on. A colleague
+  working the same PR, or you returning from a fresh session, gets a new block
+  at the bottom; the same session coming back only refreshes its own, never
+  touching anyone else's. Collapsed by default, so several stay out of the way.
 
 ## Why not `claude --from-pr`?
 
@@ -178,9 +179,12 @@ The hook reads the Claude Code hook event JSON from stdin:
    from `$GH_TOKEN`/`$GITHUB_TOKEN`, falling back to `gh auth token`.
 4. Reads the token's own GitHub login via `GET /user` — that, not the PR
    author, is whose footer this run owns.
-5. Rewrites its own block in place, or appends one, leaving every other
-   person's block exactly where it was.
-6. If the body would be unchanged, skips the `PATCH` entirely.
+5. Reads the model and effort of the latest assistant turn from the session
+   transcript (`transcript_path` in the hook event) — the event itself carries
+   neither — and stamps them into the summary with the current local time.
+6. Rewrites the block for this login *and* session in place, or appends one at
+   the bottom, leaving every other block exactly where it was.
+7. If the body would be unchanged, skips the `PATCH` entirely.
 
 The hook never blocks the tool call (`PostToolUse` can't block anyway) and
 logs failures to stderr rather than raising, so a broken token or a network

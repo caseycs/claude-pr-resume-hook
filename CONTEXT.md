@@ -8,13 +8,15 @@ the PR days later.
 
 **Resume footer**:
 A collapsed `<details>` block in a PR description naming whose session to
-return to and the command that returns to it. A body carries one per user, all
-of them after a single horizontal rule at the end.
+return to, when it last touched the PR and on what model/effort, and the command
+that returns to it. A body carries one per user and session, all of them after a
+single horizontal rule at the end.
 _Avoid_: footer line, resume link, signature, trailer
 
 **Footer owner**:
 The person a footer belongs to: the GitHub login of the token that wrote it,
-named in the block's summary. Decides which block a run may rewrite.
+named in the block's summary. Together with the session, decides which block a
+run may rewrite.
 _Avoid_: author, session user, committer
 
 **Session**:

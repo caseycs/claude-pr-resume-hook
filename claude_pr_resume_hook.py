@@ -10,7 +10,7 @@ create`/`gh pr edit` Bash call, appends (or replaces) a trailing footer:
     ---
 
     <details>
-    <summary>AI session - your-github-login</summary>
+    <summary>AI session - your-github-login, 24 September 2026 09:28 CEST, Opus5.5/high</summary>
 
     ```
     cd ~/path/to/worktree; claude -r <session_id>
@@ -22,15 +22,18 @@ The directory and session come straight from the hook event, so the footer
 always points at the session that produced the PR. Paths under $HOME are
 written tilde-relative so the footer never publishes a local username.
 
-Footers are keyed on the authenticated GitHub login, one block per person: a
-PR touched by several people carries a block each, and every run adds or
-updates only its own.
+Footers are keyed on the authenticated GitHub login plus the session, one block
+per session: a PR touched by several people, or by one person from several
+sessions, carries a block each, and every run adds or updates only its own. The
+summary records when the session last touched the PR and the model/effort it ran
+on, read from the session transcript.
 
 Run with no arguments to act as the hook. Run `install` / `uninstall` to
 register or remove the hook in a Claude Code settings file.
 """
 import argparse
 import copy
+import datetime
 import getpass
 import json
 import os
@@ -74,14 +77,22 @@ INLINE_FOOTER_RE = re.compile(
     re.IGNORECASE,
 )
 # The current footer: a collapsed <details> block whose summary names whose
-# session it is. One per user - see docs/adr/0006.
+# session it is, optionally followed by when and on what model. One per user and
+# session - see docs/adr/0006 and 0008. Logins never contain commas.
 FOOTER_DETAILS_RE = re.compile(
     r"[ \t]*<details>[ \t]*\n"
-    r"[ \t]*<summary>[ \t]*AI session[ \t]*-[ \t]*(?P<user>[^<\n]*?)[ \t]*</summary>"
+    r"[ \t]*<summary>[ \t]*AI session[ \t]*-[ \t]*(?P<user>[^<\n,]*?)[ \t]*"
+    r"(?:,[^<\n]*)?</summary>"
     r".*?"
     r"</details>[ \t]*",
     re.DOTALL | re.IGNORECASE,
 )
+# The session a footer resumes, read back out of its command.
+FOOTER_SESSION_RE = re.compile(r"claude -r (\S+)")
+# The date suffix on a pinned model id, e.g. the 20251001 in claude-haiku-4-5-20251001.
+MODEL_DATE_RE = re.compile(r"^\d{8}$")
+# Transcripts grow large; the last assistant turn is always near the end.
+TRANSCRIPT_TAIL_BYTES = 1 << 20
 # A thematic break left dangling once the footers below it are lifted out.
 TRAILING_RULE_RE = re.compile(r"\n+[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*\s*\Z")
 # Characters safe to leave bare in a shell word. Everything else gets a
@@ -174,11 +185,73 @@ def footer_user(token):
     return fallback
 
 
-def footer_for(cwd, session_id, user):
+def now():
+    """The local time, with its zone. A function so tests can pin it."""
+    return datetime.datetime.now().astimezone()
+
+
+def model_label(model_id):
+    """A short model name: claude-fable-5-5 -> Fable5.5, claude-haiku-4-5-20251001 -> Haiku4.5."""
+    bare = re.sub(r"\[[^\]]*\]$", "", model_id.strip())
+    parts = [p for p in bare.split("-") if p and not MODEL_DATE_RE.match(p)]
+    if parts and parts[0].lower() == "claude":
+        parts = parts[1:]
+    names = [p for p in parts if not p.isdigit()]
+    numbers = [p for p in parts if p.isdigit()]
+    if not names:
+        return bare
+    return "".join(n.capitalize() for n in names) + ".".join(numbers)
+
+
+def session_model(transcript_path):
+    """(model, effort) of the session's latest assistant turn, either possibly None.
+
+    Hook events don't carry the model or effort, but every assistant entry in the
+    transcript does. The PR was written by the turn in progress, so the last
+    entry is the one that counts.
+    """
+    if not transcript_path:
+        return None, None
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - TRANSCRIPT_TAIL_BYTES))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return None, None
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("type") != "assistant":
+            continue
+        message = entry.get("message")
+        model = message.get("model") if isinstance(message, dict) else None
+        # Claude Code writes locally generated messages under a placeholder model.
+        if not model or model.startswith("<"):
+            continue
+        effort = entry.get("effort")
+        return model, effort if isinstance(effort, str) and effort else None
+    return None, None
+
+
+def session_stamp(when=None, model=None, effort=None):
+    """The summary suffix: `, 24 September 2026 09:28 CEST, Opus5.5/high`."""
+    parts = []
+    if when is not None:
+        parts.append(f"{when.day} {when:%B %Y %H:%M %Z}".strip())
+    runs_on = "/".join(x for x in (model and model_label(model), effort) if x)
+    if runs_on:
+        parts.append(runs_on)
+    return "".join(f", {part}" for part in parts)
+
+
+def footer_for(cwd, session_id, user, stamp=""):
     command = f"cd {display_cwd(cwd)}; claude -r {shell_escape(session_id)}"
     return (
         "<details>\n"
-        f"<summary>AI session - {user}</summary>\n"
+        f"<summary>AI session - {user}{stamp}</summary>\n"
         "\n"
         f"```\n{command}\n```\n"
         "\n"
@@ -198,7 +271,7 @@ def strip_legacy_footers(body):
 
 
 def split_footers(body):
-    """Separate a body into (prose, [(user, footer_text), ...]).
+    """Separate a body into (prose, [(user, session, footer_text), ...]).
 
     Footers are lifted out in the order they appear, so rewriting one leaves
     every other session's block exactly where its owner put it.
@@ -206,7 +279,12 @@ def split_footers(body):
     footers = []
 
     def lift(match):
-        footers.append((match.group("user").strip(), match.group(0).strip()))
+        session = FOOTER_SESSION_RE.search(match.group(0))
+        footers.append((
+            match.group("user").strip(),
+            session.group(1) if session else None,
+            match.group(0).strip(),
+        ))
         return "\n"
 
     prose = FOOTER_DETAILS_RE.sub(lift, body)
@@ -219,16 +297,22 @@ def same_user(a, b):
     return a.strip().lower() == b.strip().lower()
 
 
-def build_body(body, cwd, session_id, user):
+def build_body(body, cwd, session_id, user, stamp=""):
     prose, footers = split_footers(strip_legacy_footers(normalize(body)))
 
-    ours = footer_for(cwd, session_id, user)
-    # Update our own block in place; never touch anyone else's.
-    updated = [(who, ours if same_user(who, user) else text) for who, text in footers]
-    if not any(same_user(who, user) for who, _ in updated):
-        updated.append((user, ours))
+    ours = footer_for(cwd, session_id, user, stamp)
+    session = shell_escape(session_id)
 
-    blocks = "\n\n".join(text for _, text in updated)
+    def is_ours(who, their_session):
+        return same_user(who, user) and their_session == session
+
+    # Update this session's block in place; another session - yours or anyone
+    # else's - keeps its own, and a new session goes at the bottom.
+    blocks = [ours if is_ours(who, s) else text for who, s, text in footers]
+    if not any(is_ours(who, s) for who, s, _ in footers):
+        blocks.append(ours)
+
+    blocks = "\n\n".join(blocks)
     if prose:
         return f"{prose}\n\n---\n\n{blocks}\n"
     return f"{blocks}\n"
@@ -350,7 +434,9 @@ def run_hook():
     # Compare against the normalized body, so a body that already carries the
     # right footer never triggers a pointless PATCH over CRLF differences alone.
     current_body = normalize(pr.get("body"))
-    new_body = build_body(current_body, cwd, session_id, footer_user(token))
+    model, effort = session_model(event.get("transcript_path"))
+    stamp = session_stamp(now(), model, effort)
+    new_body = build_body(current_body, cwd, session_id, footer_user(token), stamp)
     if new_body == current_body:
         return 0
 
