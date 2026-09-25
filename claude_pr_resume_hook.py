@@ -51,7 +51,13 @@ import urllib.request
 from pathlib import Path
 
 GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(create|edit|comment|review)\b")
+GH_ISSUE_COMMAND_RE = re.compile(r"\bgh\s+issue\s+(create|edit|comment)\b")
 PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+# A PR or an issue. `gh issue comment` accepts a PR number too, and then prints
+# a /pull/ URL, so the issue routes take whichever the URL says.
+ISSUE_OR_PR_URL_RE = re.compile(r"https://github\.com/([^/\s\"]+)/([^/\s\"]+)/(pull|issues)/(\d+)")
+# The REST collection each URL kind lives under.
+REST_KIND = {"pull": "pulls", "issues": "issues"}
 
 # The heading line of a footer, in any of its hand-edited guises. Tolerates the
 # older wording ("Resume session:") so footers written by earlier versions are
@@ -102,15 +108,16 @@ GENERATOR_ATTR_RE = re.compile(r'\bdata-generator="([^"]*)"', re.IGNORECASE)
 # from before it existed fall back to the date in their summary.
 FOOTER_UPDATED_RE = re.compile(r'<details[^>\n]*\bdata-updated="([^"]+)"', re.IGNORECASE)
 SUMMARY_DATE_RE = re.compile(r"<summary>[^<\n]*?, (\d{1,2} [A-Za-z]+ \d{4} \d{2}:\d{2})")
-# A `gh pr edit` that rewrites the description, rather than only the title or labels.
+# A `gh pr|issue edit` that rewrites the description, rather than only the title or labels.
 GH_BODY_FLAG_RE = re.compile(r"(?:^|\s)(?:-b|--body|-F|--body-file)(?=[\s=]|$)")
 # Only an edit this recent can be the one that just ran; see previous_body().
 EDIT_WINDOW = datetime.timedelta(minutes=10)
 PREVIOUS_BODY_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      userContentEdits(last: 2) { nodes { editedAt diff } }
+    issueOrPullRequest(number: $number) {
+      ... on Issue { userContentEdits(last: 2) { nodes { editedAt diff } } }
+      ... on PullRequest { userContentEdits(last: 2) { nodes { editedAt diff } } }
     }
   }
 }
@@ -134,37 +141,45 @@ CONSOLE_SCRIPT = "claude-pr-resume-hook"
 TOOL_SOURCE = "git+https://github.com/caseycs/claude-pr-resume-hook"
 # Bash subcommands the hook fires on, turned into Claude Code `if` filters.
 # `if` is an optimisation, not a guarantee: it fails open when Claude Code
-# cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE.
-MATCHED_COMMANDS = ("gh pr create", "gh pr edit", "gh pr comment", "gh pr review")
+# cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE and
+# GH_ISSUE_COMMAND_RE.
+MATCHED_COMMANDS = (
+    "gh pr create",
+    "gh pr edit",
+    "gh pr comment",
+    "gh pr review",
+    "gh issue create",
+    "gh issue edit",
+    "gh issue comment",
+)
 # `gh pr review` flags that take a value, so their value is not the PR selector.
 REVIEW_VALUE_FLAGS = ("-b", "--body", "-F", "--body-file", "-R", "--repo")
 # Where a shell command ends and the next begins, as shlex splits them.
 SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&", ";;", "(", ")"})
-# The GitHub MCP server's tools that write to a PR: open or edit it, comment on
-# it, review it, reply in a review thread. `install` pins the server key, since
+# The GitHub MCP server's tools that write to a PR or an issue: open or edit
+# it, comment on it, review it, reply in a review thread. `install` pins the
+# server key, since
 # it cannot know how yours is configured; the regex below stays tolerant so a
 # hand-widened matcher (a renamed server, or a plugin-bundled one named
 # `mcp__plugin_<plugin>_<server>__…`) still works.
 MCP_SERVER = "github"
-MCP_PR_TOOLS = (
+MCP_TOOLS = (
     "create_pull_request",
     "update_pull_request",
     "add_issue_comment",
     "pull_request_review_write",
     "add_reply_to_pull_request_comment",
+    "issue_write",
 )
-MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_PR_TOOLS))
-MCP_PR_TOOL_RE = re.compile(r"^mcp__.+__(?P<tool>{})$".format("|".join(MCP_PR_TOOLS)))
+MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_TOOLS))
+MCP_TOOL_RE = re.compile(r"^mcp__.+__(?P<tool>{})$".format("|".join(MCP_TOOLS)))
 
 # Every settings entry install maintains: which tool event to match, how to
 # narrow it, and what to call it when reporting.
-HOOK_TARGETS = (
-    {"matcher": "Bash", "if": "Bash(gh pr create*)", "label": "gh pr create"},
-    {"matcher": "Bash", "if": "Bash(gh pr edit*)", "label": "gh pr edit"},
-    {"matcher": "Bash", "if": "Bash(gh pr comment*)", "label": "gh pr comment"},
-    {"matcher": "Bash", "if": "Bash(gh pr review*)", "label": "gh pr review"},
-    {"matcher": MCP_MATCHER, "if": None, "label": "github mcp pull requests"},
-)
+HOOK_TARGETS = tuple(
+    {"matcher": "Bash", "if": f"Bash({command}*)", "label": command}
+    for command in MATCHED_COMMANDS
+) + ({"matcher": MCP_MATCHER, "if": None, "label": "github mcp tools"},)
 # A hook entry whose command mentions any of these belongs to us, and is
 # reconciled on install rather than duplicated.
 OURS_MARKERS = ("claude-pr-resume-hook", "claude_pr_resume_hook", "append_resume_footer")
@@ -561,24 +576,6 @@ def pr_from_mcp(event, tool):
     except (TypeError, ValueError):
         blob = ""
 
-    if tool == "add_issue_comment":
-        # Also used on plain issues, which must be left alone. The comment URL
-        # says which it was: github.com/o/r/pull/N#issuecomment-… only for a PR.
-        # Checked against the input rather than searched for, since an older
-        # server echoes the comment body, which may link to other PRs.
-        target = pr_from_input(tool_input, "issue_number")
-        if not target:
-            return None
-        owner, repo, number = target
-        on_pr = re.search(
-            r"https://github\.com/{}/{}/pull/{}#issuecomment-".format(
-                re.escape(owner), re.escape(repo), number
-            ),
-            blob,
-            re.IGNORECASE,
-        )
-        return target if on_pr else None
-
     if tool == "pull_request_review_write":
         # Returns only a status sentence; the input names the PR. Throwing away a
         # pending review leaves nothing on the PR to point back from.
@@ -609,18 +606,99 @@ def pr_from_mcp(event, tool):
     return None
 
 
+def issue_from_bash(event):
+    """(owner, repo, number, kind) for a `gh issue create|edit|comment` call, or None."""
+    command = event.get("tool_input", {}).get("command", "")
+    if not GH_ISSUE_COMMAND_RE.search(command):
+        return None
+    response = event.get("tool_response")
+    stdout = response.get("stdout") if isinstance(response, dict) else None
+    # All three print the issue URL - comment with a #issuecomment anchor. No URL
+    # means the command failed, or was `--web`.
+    match = ISSUE_OR_PR_URL_RE.search(stdout or "")
+    if not match:
+        return None
+    owner, repo, kind, number = match.groups()
+    return owner, repo, number, REST_KIND[kind]
+
+
+def target_from_bash(event):
+    """(owner, repo, number, kind) for any Bash route, or None."""
+    pr = pr_from_bash(event)
+    if pr:
+        return pr + ("pulls",)
+    return issue_from_bash(event)
+
+
+def target_from_mcp(event, tool):
+    """(owner, repo, number, kind) for a GitHub MCP write to a PR or issue, or None."""
+    tool_input = event.get("tool_input")
+    try:
+        blob = json.dumps(event.get("tool_response"))
+    except (TypeError, ValueError):
+        blob = ""
+
+    if tool == "add_issue_comment":
+        # Used on PRs and issues alike; the comment URL says which it landed on.
+        # Checked against the input rather than searched for, since an older
+        # server echoes the comment body, which may link elsewhere.
+        target = pr_from_input(tool_input, "issue_number")
+        if not target:
+            return None
+        owner, repo, number = target
+        landed = re.search(
+            r"https://github\.com/{}/{}/(pull|issues)/{}#issuecomment-".format(
+                re.escape(owner), re.escape(repo), number
+            ),
+            blob,
+            re.IGNORECASE,
+        )
+        return target + (REST_KIND[landed.group(1)],) if landed else None
+
+    if tool == "issue_write":
+        if not isinstance(tool_input, dict):
+            return None
+        if tool_input.get("method") == "update":
+            target = pr_from_input(tool_input, "issue_number")
+            return target + ("issues",) if target else None
+        # create returns {"id": ..., "url": ".../issues/N"}; the id is not the
+        # number. Anchored on the input's repo, like the comment above.
+        owner, repo = tool_input.get("owner"), tool_input.get("repo")
+        if not owner or not repo:
+            return None
+        created = re.search(
+            r"https://github\.com/({})/({})/issues/(\d+)".format(
+                re.escape(str(owner)), re.escape(str(repo))
+            ),
+            blob,
+            re.IGNORECASE,
+        )
+        return created.groups() + ("issues",) if created else None
+
+    pr = pr_from_mcp(event, tool)
+    return pr + ("pulls",) if pr else None
+
+
 def edits_body(event):
-    """Whether the call rewrote the PR description, and so may have dropped footers."""
+    """Whether the call rewrote the description, and so may have dropped footers."""
     tool_name = event.get("tool_name") or ""
     tool_input = event.get("tool_input")
     if not isinstance(tool_input, dict):
         return False
     if tool_name == "Bash":
         command = tool_input.get("command") or ""
-        found = GH_PR_COMMAND_RE.search(command)
-        return bool(found and found.group(1) == "edit" and GH_BODY_FLAG_RE.search(command[found.end():]))
-    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
-    return bool(mcp_tool and mcp_tool.group("tool") == "update_pull_request" and "body" in tool_input)
+        for command_re in (GH_PR_COMMAND_RE, GH_ISSUE_COMMAND_RE):
+            found = command_re.search(command)
+            if found and found.group(1) == "edit" and GH_BODY_FLAG_RE.search(command[found.end():]):
+                return True
+        return False
+    mcp_tool = MCP_TOOL_RE.match(tool_name)
+    if not mcp_tool or "body" not in tool_input:
+        return False
+    tool = mcp_tool.group("tool")
+    return tool == "update_pull_request" or (
+        tool == "issue_write" and tool_input.get("method") == "update"
+    )
 
 
 def parse_github_time(text):
@@ -641,7 +719,7 @@ def previous_body(owner, repo, number, token, current_body):
             "query": PREVIOUS_BODY_QUERY,
             "variables": {"owner": owner, "repo": repo, "number": int(number)},
         })
-        nodes = data["data"]["repository"]["pullRequest"]["userContentEdits"]["nodes"]
+        nodes = data["data"]["repository"]["issueOrPullRequest"]["userContentEdits"]["nodes"]
     except Exception as e:
         print(f"{CONSOLE_SCRIPT}: could not read the description's edit history ({e})", file=sys.stderr)
         return None
@@ -667,17 +745,17 @@ def run_hook():
     event = json.load(sys.stdin)
 
     tool_name = event.get("tool_name") or ""
-    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
+    mcp_tool = MCP_TOOL_RE.match(tool_name)
     if tool_name == "Bash":
-        target = pr_from_bash(event)
+        target = target_from_bash(event)
     elif mcp_tool:
-        target = pr_from_mcp(event, mcp_tool.group("tool"))
+        target = target_from_mcp(event, mcp_tool.group("tool"))
     else:
         return 0
 
     if not target:
         return 0
-    owner, repo, number = target
+    owner, repo, number, kind = target
 
     cwd = event.get("cwd")
     session_id = event.get("session_id")
@@ -689,16 +767,17 @@ def run_hook():
         print(f"{CONSOLE_SCRIPT}: no GitHub token available (gh auth token failed)", file=sys.stderr)
         return 0
 
-    pr_path = f"/repos/{owner}/{repo}/pulls/{number}"
+    # PRs and issues differ only in where their description lives.
+    path = f"/repos/{owner}/{repo}/{kind}/{number}"
     try:
-        pr = api_request("GET", pr_path, token)
+        item = api_request("GET", path, token)
     except urllib.error.HTTPError as e:
-        print(f"{CONSOLE_SCRIPT}: failed to fetch PR body ({e})", file=sys.stderr)
+        print(f"{CONSOLE_SCRIPT}: failed to fetch the description ({e})", file=sys.stderr)
         return 0
 
     # Compare against the normalized body, so a body that already carries the
     # right footer never triggers a pointless PATCH over CRLF differences alone.
-    current_body = normalize(pr.get("body"))
+    current_body = normalize(item.get("body"))
     # A rewritten description may have dropped other sessions' footers - Claude
     # usually writes a new body from scratch - so recover them from the revision
     # before. Our own block is rewritten regardless.
@@ -713,9 +792,9 @@ def run_hook():
         return 0
 
     try:
-        api_request("PATCH", pr_path, token, {"body": new_body})
+        api_request("PATCH", path, token, {"body": new_body})
     except urllib.error.HTTPError as e:
-        print(f"{CONSOLE_SCRIPT}: failed to update PR body ({e})", file=sys.stderr)
+        print(f"{CONSOLE_SCRIPT}: failed to update the description ({e})", file=sys.stderr)
     return 0
 
 
@@ -842,7 +921,7 @@ def add_entries(groups, pairs):
 
 # --- verbose reporting -------------------------------------------------------
 
-# Wide enough that the longest label ("  github mcp pull requests ") still gets
+# Wide enough that the longest label ("  gh issue comment ") still gets
 # its three dots, so every line's value starts in the same column.
 _LABEL_WIDTH = 30
 

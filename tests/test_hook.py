@@ -478,7 +478,7 @@ def test_api_failure_is_reported_but_not_raised(run_event, event, monkeypatch, c
     monkeypatch.setattr(hook, "api_request", boom)
 
     assert run_event(event()) == 0
-    assert "failed to fetch PR body" in capsys.readouterr().err
+    assert "failed to fetch the description" in capsys.readouterr().err
 
 
 def test_missing_token_is_reported_but_not_raised(run_event, event, monkeypatch, capsys, api):
@@ -630,7 +630,7 @@ def test_mcp_pr_comment_refreshes_the_description(run_event, api):
     assert api.pr_calls == [("GET", "/repos/o/r/pulls/5"), ("PATCH", "/repos/o/r/pulls/5")]
 
 
-def test_mcp_comment_on_a_plain_issue_touches_nothing(run_event, api):
+def test_mcp_comment_on_a_plain_issue_refreshes_the_issue(run_event, api):
     event = mcp_event(
         "add_issue_comment",
         response={"type": "text", "text": '{"id":"1","url":"https://github.com/o/r/issues/5#issuecomment-1"}'},
@@ -639,10 +639,10 @@ def test_mcp_comment_on_a_plain_issue_touches_nothing(run_event, api):
 
     assert run_event(event) == 0
 
-    assert api.calls == []
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/5"), ("PATCH", "/repos/o/r/issues/5")]
 
 
-def test_mcp_issue_comment_linking_a_pr_touches_nothing(run_event, api):
+def test_mcp_issue_comment_linking_a_pr_refreshes_the_issue_not_the_pr(run_event, api):
     """An older server echoes the comment body; a PR linked in it is not the target."""
     body = "Duplicate of https://github.com/o/r/pull/7#issuecomment-9"
     event = mcp_event(
@@ -655,7 +655,7 @@ def test_mcp_issue_comment_linking_a_pr_touches_nothing(run_event, api):
 
     assert run_event(event) == 0
 
-    assert api.calls == []
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/5"), ("PATCH", "/repos/o/r/issues/5")]
 
 
 @pytest.mark.parametrize("method", ["create", "submit_pending"])
@@ -800,3 +800,125 @@ def test_a_description_never_edited_before_has_nothing_to_recover(run_event, eve
     run_event(edit_event(event))
 
     assert api.patches[0]["body"] == f"Body.\n\n---\n\n{FOOTER}\n"
+
+
+# --- issues ------------------------------------------------------------------
+
+
+def issue_event(event, command, stdout):
+    return event(tool_input={"command": command}, tool_response={"stdout": stdout})
+
+
+@pytest.mark.parametrize(
+    "command,stdout",
+    [
+        pytest.param("gh issue create --title Bug --body 'It broke'",
+                     "https://github.com/o/r/issues/42\n", id="create"),
+        pytest.param("gh issue edit 42 --add-label bug",
+                     "https://github.com/o/r/issues/42\n", id="edit"),
+        pytest.param("gh issue comment 42 --body 'Still broken'",
+                     "https://github.com/o/r/issues/42#issuecomment-2891234567\n", id="comment"),
+    ],
+)
+def test_gh_issue_routes_write_the_footer_into_the_issue(run_event, event, api, command, stdout):
+    api.body = "It broke."
+
+    run_event(issue_event(event, command, stdout))
+
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/42"), ("PATCH", "/repos/o/r/issues/42")]
+    assert api.patches[0]["body"] == f"It broke.\n\n---\n\n{FOOTER}\n"
+
+
+def test_gh_issue_comment_on_a_pr_number_updates_the_pr(run_event, event, api):
+    """gh issue comment accepts PR numbers; the /pull/ URL it prints says so."""
+    run_event(issue_event(
+        event, "gh issue comment 7 -b hi", "https://github.com/o/r/pull/7#issuecomment-1\n"
+    ))
+
+    assert api.pr_calls[0] == ("GET", "/repos/o/r/pulls/7")
+
+
+@pytest.mark.parametrize(
+    "command,stdout",
+    [
+        pytest.param("gh issue create --web", "", id="web-prints-no-url"),
+        pytest.param("gh issue list", "https://github.com/o/r/issues/1\n", id="read-only-subcommand"),
+        pytest.param("gh issue view 1", "https://github.com/o/r/issues/1\n", id="view"),
+    ],
+)
+def test_other_gh_issue_calls_touch_nothing(run_event, event, api, command, stdout):
+    assert run_event(issue_event(event, command, stdout)) == 0
+    assert api.calls == []
+
+
+def test_gh_issue_edit_of_the_body_recovers_dropped_footers(run_event, event, api):
+    api.body = "Rewritten issue."
+    api.edits = [("2026-09-10T09:00:00Z", f"Old issue.\n\n---\n\n{THEIRS}\n"), (JUST_NOW, api.body)]
+
+    run_event(issue_event(event, "gh issue edit 42 --body-file body.md", "https://github.com/o/r/issues/42\n"))
+
+    assert api.history_calls[0]["variables"] == {"owner": "o", "repo": "r", "number": 42}
+    assert "issueOrPullRequest" in api.history_calls[0]["query"]
+    assert api.patches[0]["body"] == f"Rewritten issue.\n\n---\n\n{THEIRS}\n\n{FOOTER}\n"
+
+
+def test_gh_issue_edit_without_a_body_skips_history(run_event, event, api):
+    run_event(issue_event(event, "gh issue edit 42 --title New", "https://github.com/o/r/issues/42\n"))
+    assert api.history_calls == []
+
+
+def test_mcp_issue_create_writes_the_footer(run_event, api):
+    event = mcp_event(
+        "issue_write",
+        response={"type": "text", "text": '{"id":"3456789012","url":"https://github.com/o/r/issues/42"}'},
+        tool_input={"method": "create", "owner": "o", "repo": "r", "title": "Bug",
+                    "body": "Same as https://github.com/o/r/issues/1"},
+    )
+
+    run_event(event)
+
+    # The URL gives the number; the database id is never used.
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/42"), ("PATCH", "/repos/o/r/issues/42")]
+    assert api.history_calls == []
+
+
+def test_mcp_issue_create_without_a_url_touches_nothing(run_event, api):
+    event = mcp_event(
+        "issue_write",
+        response={"type": "text", "text": "created"},
+        tool_input={"method": "create", "owner": "o", "repo": "r", "title": "Bug",
+                    "body": "Same as https://github.com/o/r/issues/1"},
+    )
+
+    assert run_event(event) == 0
+
+    assert api.calls == []
+
+
+def test_mcp_issue_update_uses_the_input_and_recovers(run_event, api):
+    api.body = "Rewritten issue."
+    api.edits = [("2026-09-10T09:00:00Z", f"Old.\n\n---\n\n{THEIRS}\n"), (JUST_NOW, api.body)]
+    event = mcp_event(
+        "issue_write",
+        response={"type": "text", "text": '{"id":"1","url":"https://github.com/o/r/issues/42"}'},
+        tool_input={"method": "update", "owner": "o", "repo": "r", "issue_number": 42,
+                    "body": "Rewritten issue."},
+    )
+
+    run_event(event)
+
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/42"), ("PATCH", "/repos/o/r/issues/42")]
+    assert users_in(api.patches[0]["body"]) == ["alice", "tester"]
+
+
+def test_mcp_issue_state_change_skips_history(run_event, api):
+    event = mcp_event(
+        "issue_write",
+        response={"type": "text", "text": '{"id":"1","url":"https://github.com/o/r/issues/42"}'},
+        tool_input={"method": "update", "owner": "o", "repo": "r", "issue_number": 42, "state": "closed"},
+    )
+
+    run_event(event)
+
+    assert api.patches
+    assert api.history_calls == []
