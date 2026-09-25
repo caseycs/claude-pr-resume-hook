@@ -33,7 +33,7 @@ def api(monkeypatch):
                 nodes = [{"editedAt": at, "diff": body} for at, body in self.edits[-2:]]
                 # GitHub lists them newest first.
                 nodes.reverse()
-                return {"data": {"repository": {"pullRequest": {"userContentEdits": {"nodes": nodes}}}}}
+                return {"data": {"repository": {"issueOrPullRequest": {"userContentEdits": {"nodes": nodes}}}}}
             if method == "GET":
                 return {"body": self.body}
             return {}

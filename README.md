@@ -1,10 +1,10 @@
 # claude-pr-resume-hook
 
 A [Claude Code](https://code.claude.com) `PostToolUse` hook. Every time Claude
-opens, edits, comments on or reviews a pull request in a session — through
-`gh pr create|edit|comment|review` or the GitHub MCP server — it makes sure the
-PR description ends with a block that lets you jump straight back into that
-session later:
+opens, edits, comments on or reviews a pull request — or opens, edits or
+comments on an issue — in a session, through `gh pr …`/`gh issue …` or the
+GitHub MCP server, it makes sure the description ends with a block that lets you
+jump straight back into that session later:
 
 > ---
 >
@@ -105,7 +105,10 @@ settings ..................... /Users/you/.claude/settings.json
                        now  /Users/you/.local/bin/claude-pr-resume-hook
   gh pr comment .............. adding
   gh pr review ............... adding
-  github mcp pull requests ... adding
+  gh issue create ............ adding
+  gh issue edit .............. adding
+  gh issue comment ........... adding
+  github mcp tools ........... adding
 backup ....................... settings.json.bak
 result ....................... updated - restart Claude Code
 
@@ -171,6 +174,9 @@ put this under `hooks` in the settings file of your choice:
 }
 ```
 
+Add the same entry for each other command — `gh pr comment*`,
+`gh issue create*`, `gh issue edit*`, `gh issue comment*` — to cover those too.
+
 `install` and `uninstall` recognise hand-written entries like these and
 reconcile them, so you can switch to the managed setup later without cleaning
 up first.
@@ -181,30 +187,36 @@ up first.
 
 The hook reads the Claude Code hook event JSON from stdin:
 
-1. Ignores anything that isn't a session writing to a PR: a `Bash` call running
-   `gh pr create|edit|comment|review`, or one of the GitHub MCP server's
+1. Ignores anything that isn't a session writing to a PR or an issue: a `Bash`
+   call running `gh pr create|edit|comment|review` or
+   `gh issue create|edit|comment`, or one of the GitHub MCP server's
    `create_pull_request`, `update_pull_request`, `add_issue_comment`,
-   `pull_request_review_write` or `add_reply_to_pull_request_comment`.
-2. Works out the PR's `owner/repo/number`:
+   `pull_request_review_write`, `add_reply_to_pull_request_comment` or
+   `issue_write`.
+2. Works out the PR's or issue's `owner/repo/number`:
    - `gh pr create|edit` print the PR URL and `gh pr comment` the comment's URL,
      which contains it. No URL — the command failed, or `--web` was used —
      means it does nothing.
    - `gh pr review` prints nothing outside a terminal, so the hook runs
      `gh pr view <same selector> [--repo …]` in the session's directory to ask.
-   - The MCP tools return the URL, or name the PR in their input. A comment
-     through `add_issue_comment` counts only when its URL shows it landed on a
-     PR, not a plain issue; deleting a pending review doesn't count.
-3. Fetches the current PR body and takes the session's `cwd`/`session_id`
+   - `gh issue create|edit|comment` all print the issue's URL (with a
+     `#issuecomment-…` anchor for a comment). `gh issue comment` also accepts a
+     PR number, and then prints — and updates — the PR.
+   - The MCP tools return the URL, or name the PR or issue in their input.
+     `add_issue_comment` updates whichever its comment URL shows it landed on;
+     deleting a pending review doesn't count.
+3. Fetches the current description (`/pulls/N` or `/issues/N`) and takes the session's `cwd`/`session_id`
    from the hook event, authenticating to the GitHub REST API with a token
    from `$GH_TOKEN`/`$GITHUB_TOKEN`, falling back to `gh auth token`.
-4. Reads the token's own GitHub login via `GET /user` — that, not the PR
-   author, is whose footer this run owns.
+4. Reads the token's own GitHub login via `GET /user` — that, not the PR's or
+   issue's author, is whose footer this run owns.
 5. Reads the session transcript (`transcript_path` in the hook event) for what
    the event itself doesn't carry: the model and effort of the latest assistant
    turn, and the session name — the one you set with `/rename`, else the title
    Claude Code generated. These go into the summary with the current local time.
-6. If the call rewrote the description (`gh pr edit` with `--body`/`--body-file`,
-   or MCP `update_pull_request` with a `body`), fetches the version before it
+6. If the call rewrote the description (`gh pr edit`/`gh issue edit` with
+   `--body`/`--body-file`, MCP `update_pull_request` with a `body`, or MCP
+   `issue_write` updating the `body`), fetches the version before it
    from GitHub's edit history and puts back any footer blocks the edit dropped.
 7. Rewrites the block for this login *and* session, or adds one, and orders all
    blocks by when they were last written — oldest first, so the session that
@@ -226,7 +238,7 @@ anyway. Correctness comes from the hook re-checking the command itself.
 
 ```json
 {
-  "matcher": "mcp__github__(create_pull_request|update_pull_request|add_issue_comment|pull_request_review_write|add_reply_to_pull_request_comment)",
+  "matcher": "mcp__github__(create_pull_request|update_pull_request|add_issue_comment|pull_request_review_write|add_reply_to_pull_request_comment|issue_write)",
   "hooks": [{ "type": "command", "command": "/path/to/claude-pr-resume-hook" }]
 }
 ```
@@ -235,7 +247,7 @@ The matcher needs no `if` filter — it already names the exact tools. It does,
 however, **assume your GitHub MCP server is keyed `github`**, which is the
 default but is yours to choose. If yours differs, or it comes from a plugin (those
 appear as `mcp__plugin_<plugin>_<server>__…`), edit that matcher by hand; the hook
-itself recognises PR tools on any server, so no code change is needed. Note that a
+itself recognises these tools on any server, so no code change is needed. Note that a
 bare `mcp__github` matches *nothing* — Claude Code compares metacharacter-free
 matchers as exact strings, so the parenthesised group or a `.*` suffix is required.
 

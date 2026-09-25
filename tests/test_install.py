@@ -82,12 +82,15 @@ def test_creates_user_settings_from_scratch(home, shim, monkeypatch):
 
     bash, mcp = groups
     assert bash["matcher"] == "Bash"
-    assert [e["if"] for e in bash["hooks"]] == ["Bash(gh pr create*)", "Bash(gh pr edit*)", "Bash(gh pr comment*)", "Bash(gh pr review*)"]
+    assert [e["if"] for e in bash["hooks"]] == [
+        "Bash(gh pr create*)", "Bash(gh pr edit*)", "Bash(gh pr comment*)", "Bash(gh pr review*)",
+        "Bash(gh issue create*)", "Bash(gh issue edit*)", "Bash(gh issue comment*)",
+    ]
 
     # The MCP tools are narrowed by matcher, so they need no `if` filter.
     assert mcp["matcher"] == (
         "mcp__github__(create_pull_request|update_pull_request|add_issue_comment"
-        "|pull_request_review_write|add_reply_to_pull_request_comment)"
+        "|pull_request_review_write|add_reply_to_pull_request_comment|issue_write)"
     )
     assert len(mcp["hooks"]) == 1
     assert "if" not in mcp["hooks"][0]
