@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.4.0...v0.5.0) (2026-09-29)
+
+
+### Features
+
+* write resume footers into GitHub issues too ([84d5ce2](https://github.com/caseycs/claude-pr-resume-hook/commit/84d5ce2f529cf6448e05819f39bb184437457e31))
+* write resume footers into GitHub issues too ([b2f20ab](https://github.com/caseycs/claude-pr-resume-hook/commit/b2f20abaf1223d0ee3dcac7190fdb5db98e666e9))
+
+
+### Bug Fixes
+
+* resolve gh targets from the command, not from gh's output ([c92a130](https://github.com/caseycs/claude-pr-resume-hook/commit/c92a130d83bea89d1e40b12f98d5cf627d6522a5))
+* resolve gh targets from the command, not from gh's output ([46e5f17](https://github.com/caseycs/claude-pr-resume-hook/commit/46e5f17d415f704c8d3f5e91db39c12bc015f139))
+
 ## [0.4.0](https://github.com/caseycs/claude-pr-resume-hook/compare/v0.3.0...v0.4.0) (2026-09-24)
 
 
