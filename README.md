@@ -194,14 +194,18 @@ The hook reads the Claude Code hook event JSON from stdin:
    `pull_request_review_write`, `add_reply_to_pull_request_comment` or
    `issue_write`.
 2. Works out the PR's or issue's `owner/repo/number`:
-   - `gh pr create|edit` print the PR URL and `gh pr comment` the comment's URL,
-     which contains it. No URL — the command failed, or `--web` was used —
-     means it does nothing.
-   - `gh pr review` prints nothing outside a terminal, so the hook runs
-     `gh pr view <same selector> [--repo …]` in the session's directory to ask.
-   - `gh issue create|edit|comment` all print the issue's URL (with a
-     `#issuecomment-…` anchor for a comment). `gh issue comment` also accepts a
-     PR number, and then prints — and updates — the PR.
+   - For `gh`, from the command itself, for every `gh pr|issue` call in it —
+     not from what `gh` printed, which Claude often sends to `/dev/null` or
+     follows with other PRs' links:
+     - a URL selector names the target outright;
+     - otherwise the repo comes from `--repo`, or the `upstream`/`github`/`origin`
+       remote of the directory the call runs in, following any `cd` before it;
+     - the number is the selector, or — for a PR named by branch or not at all,
+       as with `gh pr create` — the branch's open PR, found over the REST API.
+
+     Only if that fails, and the command made a single call that printed
+     exactly one link, is that link used. `--web` does nothing. The local
+     lookups are `git config` and `git rev-parse`; no `gh` subcommand runs.
    - The MCP tools return the URL, or name the PR or issue in their input.
      `add_issue_comment` updates whichever its comment URL shows it landed on;
      deleting a pending review doesn't count.

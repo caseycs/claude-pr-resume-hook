@@ -92,7 +92,7 @@ def test_url_is_read_from_stdout_not_the_command(run_event, event, api):
         tool_response={"stdout": "Creating pull request\nhttps://github.com/o2/r2/pull/7\n"},
     )
     assert run_event(event_dict) == 0
-    assert api.calls[0][1] == "/repos/o2/r2/pulls/7"
+    assert api.pr_calls[0][1] == "/repos/o2/r2/pulls/7"
 
 
 def test_unchanged_body_skips_the_patch(run_event, event, api):
@@ -361,7 +361,7 @@ def test_mcp_update_pull_request_also_fires(run_event, api):
 def test_the_pr_url_is_found_whatever_the_response_shape(run_event, api, response):
     """How Claude Code nests MCP content is undocumented, so do not depend on it."""
     assert run_event(mcp_event(response=response)) == 0
-    assert api.calls[0][1] == "/repos/o/r/pulls/9"
+    assert api.pr_calls[0][1] == "/repos/o/r/pulls/9"
 
 
 def test_the_database_id_is_never_used_as_a_pr_number(run_event, api):
@@ -377,7 +377,7 @@ def test_update_falls_back_to_the_input_fields_without_a_url(run_event, api):
 
     assert run_event(event) == 0
 
-    assert api.calls[0][1] == "/repos/o2/r2/pulls/42"
+    assert api.pr_calls[0][1] == "/repos/o2/r2/pulls/42"
 
 
 def test_a_float_pull_number_is_normalized(run_event, api):
@@ -387,7 +387,7 @@ def test_a_float_pull_number_is_normalized(run_event, api):
 
     run_event(event)
 
-    assert api.calls[0][1] == "/repos/o/r/pulls/42"
+    assert api.pr_calls[0][1] == "/repos/o/r/pulls/42"
 
 
 def test_a_pr_url_in_the_input_body_is_never_used(run_event, api):
@@ -550,72 +550,170 @@ def test_gh_pr_comment_without_a_url_does_nothing(run_event, event, api):
     assert api.calls == []
 
 
-@pytest.fixture
-def gh_view(monkeypatch):
-    """Stub `gh pr view`, recording how it was called."""
-
-    class GhView:
-        calls = []
-        url = "https://github.com/o/r/pull/12\n"
-        fail = False
-
-    def fake_run(argv, **kwargs):
-        GhView.calls.append((argv, kwargs.get("cwd")))
-        if GhView.fail:
-            raise hook.subprocess.CalledProcessError(1, argv)
-        return hook.subprocess.CompletedProcess(argv, 0, stdout=GhView.url, stderr="")
-
-    monkeypatch.setattr(hook.subprocess, "run", fake_run)
-    return GhView
-
-
-def review(command):
+def review(command, cwd="/work/tree"):
     """A `gh pr review` event: gh prints nothing when stdout isn't a terminal."""
     return {
         "tool_name": "Bash",
         "tool_input": {"command": command},
         "tool_response": {"stdout": "", "stderr": ""},
-        "cwd": "/work/tree",
+        "cwd": cwd,
         "session_id": "sess-abc",
     }
 
 
-def test_gh_pr_review_asks_gh_which_pr_it_was(run_event, api, gh_view):
+def test_gh_pr_review_is_resolved_from_the_checkout(run_event, api, git):
     run_event(review("gh pr review 12 --approve"))
 
-    assert gh_view.calls == [
-        (["gh", "pr", "view", "12", "--json", "url", "--jq", ".url"], "/work/tree")
-    ]
     assert api.pr_calls == [("GET", "/repos/o/r/pulls/12"), ("PATCH", "/repos/o/r/pulls/12")]
 
 
 @pytest.mark.parametrize(
     "command,expected",
     [
-        pytest.param("gh pr review --comment -b 'nit: 42'",
-                     ["gh", "pr", "view"], id="current-branch"),
-        pytest.param("gh pr review -R o/r 12 -r --body 'see 99'",
-                     ["gh", "pr", "view", "12", "--repo", "o/r"], id="repo-flag"),
-        pytest.param("gh pr review --repo=o/r --body-file notes.md feature-x --approve",
-                     ["gh", "pr", "view", "feature-x", "--repo", "o/r"], id="equals-and-branch"),
-        pytest.param("gh pr review 12 --approve && gh pr merge 13",
-                     ["gh", "pr", "view", "12"], id="stops-at-operator"),
+        pytest.param("gh pr review --comment -b 'nit: 42'", "/repos/o/r/pulls/7", id="current-branch"),
+        pytest.param("gh pr review -R o2/r2 12 -r --body 'see 99'", "/repos/o2/r2/pulls/12", id="repo-flag"),
+        pytest.param("gh pr review --repo=o2/r2 --body-file notes.md feature-x --approve",
+                     "/repos/o2/r2/pulls/8", id="equals-and-branch"),
+        pytest.param("gh pr review 12 --approve && gh pr merge 13", "/repos/o/r/pulls/12", id="stops-at-operator"),
+        pytest.param("gh pr review https://github.com/o3/r3/pull/5 -a", "/repos/o3/r3/pulls/5", id="url-selector"),
         pytest.param("cd /x && gh pr review 12 -c -b \"$(cat <<'EOF'\nit's fine\nEOF\n)\"",
-                     ["gh", "pr", "view", "12"], id="heredoc-body"),
+                     "/repos/ox/rx/pulls/12", id="heredoc-body-and-cd"),
     ],
 )
-def test_the_review_selector_is_read_from_the_command(run_event, api, gh_view, command, expected):
+def test_the_review_target_is_read_from_the_command(run_event, api, git, command, expected):
+    git.checkouts["/x"] = {"remotes": {"origin": "https://github.com/ox/rx.git"}}
+    api.open_prs = {"o:feature": 7, "o2:feature-x": 8}
+
     run_event(review(command))
 
-    assert gh_view.calls[0][0] == expected + ["--json", "url", "--jq", ".url"]
+    assert api.pr_calls[0] == ("GET", expected)
 
 
-def test_a_review_gh_cannot_resolve_does_nothing(run_event, api, gh_view):
-    gh_view.fail = True
+def test_a_review_that_cannot_be_resolved_does_nothing(run_event, api, git):
+    assert run_event(review("gh pr review 12 --approve", cwd="/not/a/checkout")) == 0
+    assert api.pr_calls == []
 
-    assert run_event(review("gh pr review 12 --approve")) == 0
 
-    assert api.calls == []
+# --- the edits that used to go unnoticed --------------------------------------
+
+
+def bash(command, stdout="", cwd="/work/tree"):
+    return {
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_response": {"stdout": stdout, "stderr": ""},
+        "cwd": cwd,
+        "session_id": "sess-abc",
+    }
+
+
+def test_an_edit_with_its_output_discarded_is_still_handled(run_event, api, git):
+    """Claude redirects gh's output to /dev/null, taking the PR URL with it."""
+    run_event(bash("gh pr edit 19 --body-file /tmp/pr1.md >/dev/null && echo ok", stdout="ok\n"))
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/19"), ("PATCH", "/repos/o/r/pulls/19")]
+    assert len(api.history_calls) == 1
+
+
+def test_the_session_that_lost_its_footers(run_event, api, git):
+    """Replays the command that stripped cloudflare-terraform#19 and #20 for good."""
+    wt = "/Users/me/nobi/agentic-devops/r2/cloudflare-terraform--r2"
+    git.checkouts[wt] = {"remotes": {"origin": "git@github.com:Nobi-BV/cloudflare-terraform.git"}}
+    command = (
+        "S=/private/tmp/scratchpad; cd " + wt + " && "
+        'gh pr edit 19 --title "R2 [1/6] buckets" --body-file $S/pr1.md >/dev/null && '
+        'gh pr edit 20 --title "R2 [2/6] cache" >/dev/null && echo ok'
+    )
+
+    run_event(bash(command, stdout="ok\n", cwd="/Users/me/nobi/agentic-devops"))
+
+    assert [c for c in api.pr_calls if c[0] == "PATCH"] == [
+        ("PATCH", "/repos/Nobi-BV/cloudflare-terraform/pulls/19"),
+        ("PATCH", "/repos/Nobi-BV/cloudflare-terraform/pulls/20"),
+    ]
+    # Only #19's description was rewritten, so only it consults the history.
+    assert [c["variables"]["number"] for c in api.history_calls] == [19]
+
+
+def test_links_printed_after_the_edit_are_not_mistaken_for_it(run_event, api, git):
+    command = "gh pr edit 19 --body-file f && gh pr view 19 --json body -q .body | grep -n webhooks"
+    stdout = "26:- https://github.com/o/webhooks/pull/42 - upload assets\n"
+
+    run_event(bash(command, stdout=stdout))
+
+    assert {p for _, p in api.pr_calls} == {"/repos/o/r/pulls/19"}
+
+
+def test_a_create_with_its_output_discarded_finds_the_branch_pr(run_event, api, git):
+    api.open_prs = {"o:feature": 31}
+
+    run_event(bash("gh pr create --fill >/dev/null"))
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/31"), ("PATCH", "/repos/o/r/pulls/31")]
+
+
+def test_create_honours_head(run_event, api, git):
+    api.open_prs = {"o:other": 32}
+
+    run_event(bash("gh pr create -H other -t T -b B >/dev/null"))
+
+    assert api.pr_calls[0] == ("GET", "/repos/o/r/pulls/32")
+
+
+def test_upstream_is_preferred_over_origin_like_gh(run_event, api, git):
+    git.checkouts["/work/tree"]["remotes"]["upstream"] = "https://github.com/up/r"
+
+    run_event(bash("gh pr edit 3 -t T >/dev/null"))
+
+    assert api.pr_calls[0] == ("GET", "/repos/up/r/pulls/3")
+
+
+def test_an_unfollowable_cd_falls_back_to_the_single_printed_link(run_event, api, git):
+    run_event(bash('cd "$WT" && gh pr edit 3 -t T', stdout="https://github.com/o9/r9/pull/3\n"))
+
+    assert api.pr_calls[0] == ("GET", "/repos/o9/r9/pulls/3")
+
+
+def test_several_printed_links_are_never_guessed_between(run_event, api, git):
+    stdout = "https://github.com/a/b/pull/1\nhttps://github.com/c/d/pull/2\n"
+
+    assert run_event(bash('cd "$WT" && gh pr edit 3 -t T', stdout=stdout)) == 0
+
+    assert api.pr_calls == []
+
+
+def test_the_same_pr_twice_is_written_once(run_event, api, git):
+    run_event(bash("gh pr edit 5 -t T >/dev/null && gh pr edit 5 --body-file b >/dev/null"))
+
+    assert [c for c in api.pr_calls if c[0] == "PATCH"] == [("PATCH", "/repos/o/r/pulls/5")]
+    assert len(api.history_calls) == 1
+
+
+def test_an_issue_edit_with_its_output_discarded_is_handled(run_event, api, git):
+    run_event(bash("gh issue edit 42 --body-file b >/dev/null"))
+
+    assert api.pr_calls == [("GET", "/repos/o/r/issues/42"), ("PATCH", "/repos/o/r/issues/42")]
+
+
+def test_an_issue_create_with_its_output_discarded_cannot_be_found(run_event, api, git):
+    """No selector and no branch to look it up by."""
+    assert run_event(bash("gh issue create -t Bug -b x >/dev/null")) == 0
+    assert api.pr_calls == []
+
+
+def test_a_real_checkout_is_read_without_gh(tmp_path):
+    """git_output/repo_of_directory against real git, no stubs."""
+    repo = tmp_path / "checkout"
+    hook.subprocess.run(["git", "init", "-q", "-b", "topic", str(repo)], check=True)
+    hook.subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", "git@github.com:acme/widgets.git"],
+        check=True,
+    )
+
+    assert hook.repo_of_directory(str(repo)) == ("acme", "widgets")
+    calls = hook.gh_calls(f"cd {repo} && gh pr edit 7 -t x", "/elsewhere")
+    assert calls[0]["directory"] == str(repo)
+    assert hook.resolve_gh_call(calls[0], "token") == ("acme", "widgets", "7", "pulls")
 
 
 def test_mcp_pr_comment_refreshes_the_description(run_event, api):
@@ -922,3 +1020,19 @@ def test_mcp_issue_state_change_skips_history(run_event, api):
 
     assert api.patches
     assert api.history_calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param("gh pr create --fill 2>/dev/null", id="stderr-to-null"),
+        pytest.param("gh pr create --fill > out.txt 2>&1", id="both-to-file"),
+        pytest.param("gh pr create --fill &>/dev/null", id="bash-both"),
+    ],
+)
+def test_redirections_are_not_read_as_the_selector(run_event, api, git, command):
+    api.open_prs = {"o:feature": 31}
+
+    run_event(bash(command))
+
+    assert api.pr_calls[0] == ("GET", "/repos/o/r/pulls/31")
