@@ -1,14 +1,14 @@
 # claude-pr-resume-hook
 
-A Claude Code hook that keeps a pull request description pointing back at the
-Claude Code session which produced it, so you can return to that session from
-the PR days later.
+A Claude Code hook that keeps a pull request's or issue's description pointing
+back at the Claude Code sessions which worked on it, so you can return to one
+from the PR or issue days later.
 
 ## Language
 
 **Resume footer**:
-A collapsed `<details>` block in a PR description naming whose session to
-return to, the session's name, when it last touched the PR and on what
+A collapsed `<details>` block in a PR's or issue's description naming whose session to
+return to, the session's name, when it last touched it and on what
 model/effort, and the command
 that returns to it. A body carries one per user and session, all of them after a
 single horizontal rule at the end, oldest first. Ones a description rewrite
@@ -45,8 +45,8 @@ _Avoid_: binary, wrapper, entry point
 
 **Hook target**:
 One tool event the hook should fire on, as a matcher plus an optional filter —
-`gh pr create`, `gh pr edit`, `gh pr comment`, `gh pr review`, or the GitHub
-MCP server's PR write tools (including comments and reviews). What
+`gh pr create|edit|comment|review`, `gh issue create|edit|comment`, or the
+GitHub MCP server's PR and issue write tools (including comments and reviews). What
 `install` reconciles into settings, one entry per target.
 _Avoid_: trigger, rule, binding
 

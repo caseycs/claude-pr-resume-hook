@@ -88,6 +88,7 @@ def test_install_writes_the_absolute_shim_path(shim, tmp_path):
     assert commands == {str(shim.resolve())}
     assert [e["if"] for e in entries_of(tmp_path)] == [
         "Bash(gh pr create*)", "Bash(gh pr edit*)", "Bash(gh pr comment*)", "Bash(gh pr review*)",
+        "Bash(gh issue create*)", "Bash(gh issue edit*)", "Bash(gh issue comment*)",
     ]
 
 

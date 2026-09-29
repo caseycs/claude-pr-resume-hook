@@ -47,11 +47,18 @@ import shutil
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 GH_PR_COMMAND_RE = re.compile(r"\bgh\s+pr\s+(create|edit|comment|review)\b")
+GH_ISSUE_COMMAND_RE = re.compile(r"\bgh\s+issue\s+(create|edit|comment)\b")
 PR_URL_RE = re.compile(r"https://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)")
+# A PR or an issue. `gh issue comment` accepts a PR number too, and then prints
+# a /pull/ URL, so the issue routes take whichever the URL says.
+ISSUE_OR_PR_URL_RE = re.compile(r"https://github\.com/([^/\s\"]+)/([^/\s\"]+)/(pull|issues)/(\d+)")
+# The REST collection each URL kind lives under.
+REST_KIND = {"pull": "pulls", "issues": "issues"}
 
 # The heading line of a footer, in any of its hand-edited guises. Tolerates the
 # older wording ("Resume session:") so footers written by earlier versions are
@@ -102,15 +109,14 @@ GENERATOR_ATTR_RE = re.compile(r'\bdata-generator="([^"]*)"', re.IGNORECASE)
 # from before it existed fall back to the date in their summary.
 FOOTER_UPDATED_RE = re.compile(r'<details[^>\n]*\bdata-updated="([^"]+)"', re.IGNORECASE)
 SUMMARY_DATE_RE = re.compile(r"<summary>[^<\n]*?, (\d{1,2} [A-Za-z]+ \d{4} \d{2}:\d{2})")
-# A `gh pr edit` that rewrites the description, rather than only the title or labels.
-GH_BODY_FLAG_RE = re.compile(r"(?:^|\s)(?:-b|--body|-F|--body-file)(?=[\s=]|$)")
 # Only an edit this recent can be the one that just ran; see previous_body().
 EDIT_WINDOW = datetime.timedelta(minutes=10)
 PREVIOUS_BODY_QUERY = """
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
-      userContentEdits(last: 2) { nodes { editedAt diff } }
+    issueOrPullRequest(number: $number) {
+      ... on Issue { userContentEdits(last: 2) { nodes { editedAt diff } } }
+      ... on PullRequest { userContentEdits(last: 2) { nodes { editedAt diff } } }
     }
   }
 }
@@ -134,37 +140,78 @@ CONSOLE_SCRIPT = "claude-pr-resume-hook"
 TOOL_SOURCE = "git+https://github.com/caseycs/claude-pr-resume-hook"
 # Bash subcommands the hook fires on, turned into Claude Code `if` filters.
 # `if` is an optimisation, not a guarantee: it fails open when Claude Code
-# cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE.
-MATCHED_COMMANDS = ("gh pr create", "gh pr edit", "gh pr comment", "gh pr review")
-# `gh pr review` flags that take a value, so their value is not the PR selector.
-REVIEW_VALUE_FLAGS = ("-b", "--body", "-F", "--body-file", "-R", "--repo")
+# cannot parse the command, so run_hook() re-checks with GH_PR_COMMAND_RE and
+# GH_ISSUE_COMMAND_RE.
+MATCHED_COMMANDS = (
+    "gh pr create",
+    "gh pr edit",
+    "gh pr comment",
+    "gh pr review",
+    "gh issue create",
+    "gh issue edit",
+    "gh issue comment",
+)
+# Flags of each hooked gh subcommand that take a value, so the value is never
+# mistaken for the PR/issue selector. Per subcommand because short flags clash:
+# `-r` and `-a` take a value for `pr create` but are switches for `pr review`.
+# Anything not listed is treated as a switch.
+_BODY_FLAGS = {"-b", "--body", "-F", "--body-file"}
+_REPO_FLAGS = {"-R", "--repo"}
+_EDIT_FLAGS = {
+    "-t", "--title", "-B", "--base", "-m", "--milestone",
+    "--add-assignee", "--remove-assignee", "--add-label", "--remove-label",
+    "--add-project", "--remove-project", "--add-reviewer", "--remove-reviewer",
+}
+_CREATE_FLAGS = {
+    "-t", "--title", "-a", "--assignee", "-l", "--label", "-m", "--milestone",
+    "-p", "--project", "-T", "--template", "--recover",
+}
+GH_VALUE_FLAGS = {
+    ("pr", "create"): _BODY_FLAGS | _REPO_FLAGS | _CREATE_FLAGS
+    | {"-B", "--base", "-H", "--head", "-r", "--reviewer"},
+    ("pr", "edit"): _BODY_FLAGS | _REPO_FLAGS | _EDIT_FLAGS,
+    ("pr", "comment"): _BODY_FLAGS | _REPO_FLAGS,
+    ("pr", "review"): _BODY_FLAGS | _REPO_FLAGS,
+    ("issue", "create"): _BODY_FLAGS | _REPO_FLAGS | _CREATE_FLAGS,
+    ("issue", "edit"): _BODY_FLAGS | _REPO_FLAGS | _EDIT_FLAGS,
+    ("issue", "comment"): _BODY_FLAGS | _REPO_FLAGS,
+}
 # Where a shell command ends and the next begins, as shlex splits them.
 SHELL_OPERATORS = frozenset({"&&", "||", ";", "|", "&", ";;", "(", ")"})
-# The GitHub MCP server's tools that write to a PR: open or edit it, comment on
-# it, review it, reply in a review thread. `install` pins the server key, since
+# A heredoc's body, which is data rather than shell and routinely holds
+# unbalanced quotes. Group 3 keeps whatever followed the marker on its line.
+HEREDOC_RE = re.compile(
+    r"<<-?[ \t]*(['\"]?)([A-Za-z_]\w*)\1([^\n]*)\n.*?\n[ \t]*\2[ \t]*(?=\n|$)",
+    re.DOTALL,
+)
+# A GitHub remote URL, ssh or https.
+GITHUB_REMOTE_RE = re.compile(r"github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$")
+# Remotes in the order gh itself picks the base repo from.
+BASE_REMOTES = ("upstream", "github", "origin")
+# The GitHub MCP server's tools that write to a PR or an issue: open or edit
+# it, comment on it, review it, reply in a review thread. `install` pins the
+# server key, since
 # it cannot know how yours is configured; the regex below stays tolerant so a
 # hand-widened matcher (a renamed server, or a plugin-bundled one named
 # `mcp__plugin_<plugin>_<server>__…`) still works.
 MCP_SERVER = "github"
-MCP_PR_TOOLS = (
+MCP_TOOLS = (
     "create_pull_request",
     "update_pull_request",
     "add_issue_comment",
     "pull_request_review_write",
     "add_reply_to_pull_request_comment",
+    "issue_write",
 )
-MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_PR_TOOLS))
-MCP_PR_TOOL_RE = re.compile(r"^mcp__.+__(?P<tool>{})$".format("|".join(MCP_PR_TOOLS)))
+MCP_MATCHER = "mcp__{}__({})".format(MCP_SERVER, "|".join(MCP_TOOLS))
+MCP_TOOL_RE = re.compile(r"^mcp__.+__(?P<tool>{})$".format("|".join(MCP_TOOLS)))
 
 # Every settings entry install maintains: which tool event to match, how to
 # narrow it, and what to call it when reporting.
-HOOK_TARGETS = (
-    {"matcher": "Bash", "if": "Bash(gh pr create*)", "label": "gh pr create"},
-    {"matcher": "Bash", "if": "Bash(gh pr edit*)", "label": "gh pr edit"},
-    {"matcher": "Bash", "if": "Bash(gh pr comment*)", "label": "gh pr comment"},
-    {"matcher": "Bash", "if": "Bash(gh pr review*)", "label": "gh pr review"},
-    {"matcher": MCP_MATCHER, "if": None, "label": "github mcp pull requests"},
-)
+HOOK_TARGETS = tuple(
+    {"matcher": "Bash", "if": f"Bash({command}*)", "label": command}
+    for command in MATCHED_COMMANDS
+) + ({"matcher": MCP_MATCHER, "if": None, "label": "github mcp tools"},)
 # A hook entry whose command mentions any of these belongs to us, and is
 # reconciled on install rather than duplicated.
 OURS_MARKERS = ("claude-pr-resume-hook", "claude_pr_resume_hook", "append_resume_footer")
@@ -463,77 +510,214 @@ def api_request(method, path, token, payload=None):
         return json.load(resp)
 
 
-def pr_from_bash(event):
-    """(owner, repo, number) for a `gh pr create|edit|comment|review` call, or None."""
-    command = event.get("tool_input", {}).get("command", "")
-    found = GH_PR_COMMAND_RE.search(command)
-    if not found:
-        return None
-    response = event.get("tool_response")
-    stdout = response.get("stdout") if isinstance(response, dict) else None
-    # create and edit print the PR URL, comment prints the comment's URL - which
-    # is the PR URL plus an anchor. No URL means the command failed, or was `--web`.
-    match = PR_URL_RE.search(stdout or "")
-    if match:
-        return match.groups()
-    if found.group(1) == "review":
-        # gh pr review prints nothing when stdout isn't a terminal, which under
-        # Claude Code it never is, so ask gh which PR the command meant.
-        return pr_from_review_command(command[found.start():], event.get("cwd"))
-    return None
+def shell_tokens(command):
+    """Shell words and operators of `command`, or [] if it can't be split.
 
-
-def review_args(command):
-    """The arguments of the `gh pr review` that starts `command`, up to the next shell operator."""
-    for text in (command, command.split("\n", 1)[0]):
-        try:
-            lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
-            lexer.whitespace_split = True
-            tokens = list(lexer)
-            break
-        except ValueError:
-            # Unbalanced quoting, typically a heredoc body; the selector and
-            # --repo are on the first line in practice.
-            continue
-    else:
+    Heredoc bodies are dropped and newlines become `;`, so a script of several
+    lines splits into its separate commands.
+    """
+    text = HEREDOC_RE.sub(lambda m: "<<" + m.group(3), command)
+    text = text.replace("\\\n", " ").replace("\n", " ; ")
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        return list(lexer)
+    except ValueError:
         return []
-    args = []
-    for token in tokens[3:]:
-        if token in SHELL_OPERATORS:
-            break
-        args.append(token)
-    return args
 
 
-def pr_from_review_command(command, cwd):
-    """(owner, repo, number) for the PR a `gh pr review` command named, via `gh pr view`."""
-    selector = repo = None
-    args = iter(review_args(command))
+def follow_cd(directory, target):
+    """The directory after `cd target` from `directory`; None once unknowable."""
+    if target in (None, "~"):
+        return str(Path.home())
+    if target == "-" or "$" in target or "`" in target:
+        return None
+    target = os.path.expanduser(target)
+    if os.path.isabs(target):
+        return os.path.normpath(target)
+    return os.path.normpath(os.path.join(directory, target)) if directory else None
+
+
+def gh_calls(command, cwd):
+    """Every hooked `gh pr|issue <sub>` call in a Bash command.
+
+    Each is a dict of group, sub, selector, repo, head, web, edits_body and the
+    directory it runs in - the event's cwd, moved by any `cd` before it, since
+    Claude Code reports the session's directory rather than the shell's.
+    """
+    calls = []
+    directory = cwd
+    segment = []
+    for token in shell_tokens(command) + [";"]:
+        if token not in SHELL_OPERATORS:
+            segment.append(token)
+            continue
+        words = strip_redirects(segment)
+        segment = []
+        # Leading VAR=value assignments don't change what runs.
+        while words and re.match(r"^[A-Za-z_]\w*=", words[0]):
+            words = words[1:]
+        if not words:
+            continue
+        if words[0] == "cd":
+            directory = follow_cd(directory, words[1] if len(words) > 1 else None)
+        elif words[0] == "gh" and tuple(words[1:3]) in GH_VALUE_FLAGS:
+            call = parse_gh_args(words[1], words[2], words[3:])
+            call["directory"] = directory
+            calls.append(call)
+    return calls
+
+
+def is_redirect(token):
+    return token not in SHELL_OPERATORS and bool(token) and set(token) <= set("<>&")
+
+
+def strip_redirects(words):
+    """Words without redirections: `>/dev/null`, `2>&1` and the like."""
+    kept = []
+    skip = False
+    for i, word in enumerate(words):
+        if skip:
+            skip = False
+            continue
+        if is_redirect(word):
+            skip = True  # the redirect's target
+            continue
+        if word.isdigit() and i + 1 < len(words) and is_redirect(words[i + 1]):
+            continue  # the file descriptor in `2>`
+        kept.append(word)
+    return kept
+
+
+def parse_gh_args(group, sub, args):
+    """Selector, --repo, --head and the switches that matter, from a gh call's arguments."""
+    value_flags = GH_VALUE_FLAGS[(group, sub)]
+    call = {"group": group, "sub": sub, "selector": None, "repo": None,
+            "head": None, "web": False, "edits_body": False}
+    args = iter(args)
     for arg in args:
-        if arg in ("-R", "--repo"):
-            repo = next(args, None)
-        elif arg.startswith("--repo="):
-            repo = arg.split("=", 1)[1]
-        elif arg in REVIEW_VALUE_FLAGS:
-            next(args, None)
+        name, has_value, value = arg.partition("=") if arg.startswith("--") else (arg, "", None)
+        if name in value_flags:
+            if not has_value:
+                value = next(args, None)
+            if name in _REPO_FLAGS:
+                call["repo"] = value
+            elif name in ("-H", "--head"):
+                call["head"] = value
+            elif name in _BODY_FLAGS:
+                call["edits_body"] = sub == "edit"
+        elif name in ("-w", "--web"):
+            call["web"] = True
         elif arg.startswith("-"):
             continue
-        elif selector is None:
-            selector = arg
-    view = ["gh", "pr", "view"]
-    if selector:
-        view.append(selector)
-    if repo:
-        view += ["--repo", repo]
-    view += ["--json", "url", "--jq", ".url"]
+        elif call["selector"] is None:
+            call["selector"] = arg
+    return call
+
+
+def git_output(directory, *args):
+    """A local git query's output, or None. Never touches the network."""
+    if not directory:
+        return None
     try:
         out = subprocess.run(
-            view, cwd=cwd or None, capture_output=True, text=True, timeout=15, check=True
+            ["git", "-C", directory, *args],
+            capture_output=True, text=True, timeout=5, check=True,
         )
     except Exception:
         return None
-    match = PR_URL_RE.search(out.stdout)
-    return match.groups() if match else None
+    return out.stdout.strip() or None
+
+
+def repo_of_directory(directory):
+    """(owner, repo) of the GitHub remote a checkout's gh commands act on, or None."""
+    for remote in BASE_REMOTES:
+        url = git_output(directory, "config", "--get", f"remote.{remote}.url")
+        match = GITHUB_REMOTE_RE.search(url or "")
+        if match:
+            return match.groups()
+    return None
+
+
+def parse_repo_flag(value):
+    """(owner, repo) from gh's `--repo [HOST/]OWNER/REPO`, or None."""
+    parts = [p for p in (value or "").strip().rstrip("/").split("/") if p]
+    return (parts[-2], parts[-1]) if len(parts) >= 2 else None
+
+
+def open_pr_for_branch(owner, repo, branch, token):
+    """The number of the open PR whose head is `branch` in owner/repo, or None."""
+    query = urllib.parse.urlencode({"head": f"{owner}:{branch}", "state": "open", "per_page": 1})
+    try:
+        pulls = api_request("GET", f"/repos/{owner}/{repo}/pulls?{query}", token)
+    except Exception:
+        return None
+    if isinstance(pulls, list) and pulls and isinstance(pulls[0], dict) and pulls[0].get("number"):
+        return str(pulls[0]["number"])
+    return None
+
+
+def resolve_gh_call(call, token):
+    """(owner, repo, number, kind) a gh call acted on, worked out without asking gh.
+
+    gh subcommands are off limits (docs/adr/0001), and the URL gh prints is
+    unreliable: Claude often sends it to /dev/null, or prints other PRs' links
+    after it. So: a URL selector names the target outright; otherwise the repo
+    comes from --repo or the checkout's remote, and the number from the
+    selector - or, for a PR named by branch or not at all, from the branch's
+    open PR.
+    """
+    if call["web"]:
+        # Opens a browser; nothing has been written yet.
+        return None
+    selector = call["selector"]
+    kind = "pulls" if call["group"] == "pr" else "issues"
+    url = ISSUE_OR_PR_URL_RE.match(selector or "")
+    if url:
+        owner, repo, url_kind, number = url.groups()
+        return owner, repo, number, REST_KIND[url_kind]
+    repo = parse_repo_flag(call["repo"]) or repo_of_directory(call["directory"])
+    if not repo:
+        return None
+    if selector and re.fullmatch(r"#?\d+", selector):
+        # /issues/N serves PRs too, which `gh issue comment <pr number>` relies on.
+        return repo + (selector.lstrip("#"), kind)
+    if call["group"] != "pr":
+        return None
+    branch = selector or call["head"] or git_output(call["directory"], "rev-parse", "--abbrev-ref", "HEAD")
+    if not branch or branch == "HEAD":
+        return None
+    number = open_pr_for_branch(repo[0], repo[1], branch, token)
+    return repo + (number, "pulls") if number else None
+
+
+def printed_targets(stdout):
+    """Distinct (owner, repo, number, kind) linked in a command's output."""
+    found = []
+    for owner, repo, kind, number in ISSUE_OR_PR_URL_RE.findall(stdout or ""):
+        target = (owner, repo, number, REST_KIND[kind])
+        if target not in found:
+            found.append(target)
+    return found
+
+
+def targets_from_bash(event, token):
+    """[(owner, repo, number, kind, edits_body), ...] for the gh calls in a Bash command."""
+    command = (event.get("tool_input") or {}).get("command") or ""
+    calls = gh_calls(command, event.get("cwd"))
+    response = event.get("tool_response")
+    stdout = response.get("stdout") if isinstance(response, dict) else None
+    printed = printed_targets(stdout)
+    targets = []
+    for call in calls:
+        target = resolve_gh_call(call, token)
+        if not target and len(calls) == 1 and len(printed) == 1 and not call["web"]:
+            # Couldn't work it out, but gh printed exactly one link - which with
+            # one call in the command can only be the one it acted on.
+            target = printed[0]
+        if target:
+            targets.append(target + (call["edits_body"],))
+    return targets
 
 
 def pr_from_input(tool_input, number_key="pullNumber"):
@@ -560,24 +744,6 @@ def pr_from_mcp(event, tool):
         blob = json.dumps(event.get("tool_response"))
     except (TypeError, ValueError):
         blob = ""
-
-    if tool == "add_issue_comment":
-        # Also used on plain issues, which must be left alone. The comment URL
-        # says which it was: github.com/o/r/pull/N#issuecomment-… only for a PR.
-        # Checked against the input rather than searched for, since an older
-        # server echoes the comment body, which may link to other PRs.
-        target = pr_from_input(tool_input, "issue_number")
-        if not target:
-            return None
-        owner, repo, number = target
-        on_pr = re.search(
-            r"https://github\.com/{}/{}/pull/{}#issuecomment-".format(
-                re.escape(owner), re.escape(repo), number
-            ),
-            blob,
-            re.IGNORECASE,
-        )
-        return target if on_pr else None
 
     if tool == "pull_request_review_write":
         # Returns only a status sentence; the input names the PR. Throwing away a
@@ -609,18 +775,62 @@ def pr_from_mcp(event, tool):
     return None
 
 
-def edits_body(event):
-    """Whether the call rewrote the PR description, and so may have dropped footers."""
-    tool_name = event.get("tool_name") or ""
+def target_from_mcp(event, tool):
+    """(owner, repo, number, kind) for a GitHub MCP write to a PR or issue, or None."""
     tool_input = event.get("tool_input")
-    if not isinstance(tool_input, dict):
+    try:
+        blob = json.dumps(event.get("tool_response"))
+    except (TypeError, ValueError):
+        blob = ""
+
+    if tool == "add_issue_comment":
+        # Used on PRs and issues alike; the comment URL says which it landed on.
+        # Checked against the input rather than searched for, since an older
+        # server echoes the comment body, which may link elsewhere.
+        target = pr_from_input(tool_input, "issue_number")
+        if not target:
+            return None
+        owner, repo, number = target
+        landed = re.search(
+            r"https://github\.com/{}/{}/(pull|issues)/{}#issuecomment-".format(
+                re.escape(owner), re.escape(repo), number
+            ),
+            blob,
+            re.IGNORECASE,
+        )
+        return target + (REST_KIND[landed.group(1)],) if landed else None
+
+    if tool == "issue_write":
+        if not isinstance(tool_input, dict):
+            return None
+        if tool_input.get("method") == "update":
+            target = pr_from_input(tool_input, "issue_number")
+            return target + ("issues",) if target else None
+        # create returns {"id": ..., "url": ".../issues/N"}; the id is not the
+        # number. Anchored on the input's repo, like the comment above.
+        owner, repo = tool_input.get("owner"), tool_input.get("repo")
+        if not owner or not repo:
+            return None
+        created = re.search(
+            r"https://github\.com/({})/({})/issues/(\d+)".format(
+                re.escape(str(owner)), re.escape(str(repo))
+            ),
+            blob,
+            re.IGNORECASE,
+        )
+        return created.groups() + ("issues",) if created else None
+
+    pr = pr_from_mcp(event, tool)
+    return pr + ("pulls",) if pr else None
+
+
+def mcp_edits_body(tool, tool_input):
+    """Whether an MCP call rewrote the description, and so may have dropped footers."""
+    if not isinstance(tool_input, dict) or "body" not in tool_input:
         return False
-    if tool_name == "Bash":
-        command = tool_input.get("command") or ""
-        found = GH_PR_COMMAND_RE.search(command)
-        return bool(found and found.group(1) == "edit" and GH_BODY_FLAG_RE.search(command[found.end():]))
-    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
-    return bool(mcp_tool and mcp_tool.group("tool") == "update_pull_request" and "body" in tool_input)
+    return tool == "update_pull_request" or (
+        tool == "issue_write" and tool_input.get("method") == "update"
+    )
 
 
 def parse_github_time(text):
@@ -641,7 +851,7 @@ def previous_body(owner, repo, number, token, current_body):
             "query": PREVIOUS_BODY_QUERY,
             "variables": {"owner": owner, "repo": repo, "number": int(number)},
         })
-        nodes = data["data"]["repository"]["pullRequest"]["userContentEdits"]["nodes"]
+        nodes = data["data"]["repository"]["issueOrPullRequest"]["userContentEdits"]["nodes"]
     except Exception as e:
         print(f"{CONSOLE_SCRIPT}: could not read the description's edit history ({e})", file=sys.stderr)
         return None
@@ -667,17 +877,16 @@ def run_hook():
     event = json.load(sys.stdin)
 
     tool_name = event.get("tool_name") or ""
-    mcp_tool = MCP_PR_TOOL_RE.match(tool_name)
+    mcp_tool = MCP_TOOL_RE.match(tool_name)
+    command = (event.get("tool_input") or {}).get("command") if tool_name == "Bash" else None
     if tool_name == "Bash":
-        target = pr_from_bash(event)
-    elif mcp_tool:
-        target = pr_from_mcp(event, mcp_tool.group("tool"))
-    else:
+        # Cheap check before any token or git lookup; gh_calls() is the real one.
+        if not isinstance(command, str) or not (
+            GH_PR_COMMAND_RE.search(command) or GH_ISSUE_COMMAND_RE.search(command)
+        ):
+            return 0
+    elif not mcp_tool:
         return 0
-
-    if not target:
-        return 0
-    owner, repo, number = target
 
     cwd = event.get("cwd")
     session_id = event.get("session_id")
@@ -689,34 +898,59 @@ def run_hook():
         print(f"{CONSOLE_SCRIPT}: no GitHub token available (gh auth token failed)", file=sys.stderr)
         return 0
 
-    pr_path = f"/repos/{owner}/{repo}/pulls/{number}"
-    try:
-        pr = api_request("GET", pr_path, token)
-    except urllib.error.HTTPError as e:
-        print(f"{CONSOLE_SCRIPT}: failed to fetch PR body ({e})", file=sys.stderr)
+    if mcp_tool:
+        tool = mcp_tool.group("tool")
+        target = target_from_mcp(event, tool)
+        targets = [target + (mcp_edits_body(tool, event.get("tool_input")),)] if target else []
+    else:
+        targets = targets_from_bash(event, token)
+
+    # One command can touch the same PR twice; write each description once.
+    unique = {}
+    for owner, repo, number, kind, edits in targets:
+        key = (owner.lower(), repo.lower(), number)
+        if key in unique:
+            unique[key] = unique[key][:4] + (unique[key][4] or edits,)
+        else:
+            unique[key] = (owner, repo, number, kind, edits)
+    if not unique:
         return 0
 
-    # Compare against the normalized body, so a body that already carries the
-    # right footer never triggers a pointless PATCH over CRLF differences alone.
-    current_body = normalize(pr.get("body"))
-    # A rewritten description may have dropped other sessions' footers - Claude
-    # usually writes a new body from scratch - so recover them from the revision
-    # before. Our own block is rewritten regardless.
-    previous = previous_body(owner, repo, number, token, current_body) if edits_body(event) else None
     model, effort, name = read_transcript(event.get("transcript_path"))
     when = now()
     stamp = session_stamp(when, model, effort, name)
+    user = footer_user(token)
+    for owner, repo, number, kind, edits in unique.values():
+        write_footer(owner, repo, number, kind, edits, token, cwd, session_id, user, stamp, when)
+    return 0
+
+
+def write_footer(owner, repo, number, kind, edits, token, cwd, session_id, user, stamp, when):
+    # PRs and issues differ only in where their description lives.
+    path = f"/repos/{owner}/{repo}/{kind}/{number}"
+    try:
+        item = api_request("GET", path, token)
+    except urllib.error.HTTPError as e:
+        print(f"{CONSOLE_SCRIPT}: failed to fetch the description ({e})", file=sys.stderr)
+        return
+
+    # Compare against the normalized body, so a body that already carries the
+    # right footer never triggers a pointless PATCH over CRLF differences alone.
+    current_body = normalize(item.get("body"))
+    # A rewritten description may have dropped other sessions' footers - Claude
+    # usually writes a new body from scratch - so recover them from the revision
+    # before. Our own block is rewritten regardless.
+    previous = previous_body(owner, repo, number, token, current_body) if edits else None
     new_body = build_body(
-        current_body, cwd, session_id, footer_user(token), stamp, updated=when, previous=previous
+        current_body, cwd, session_id, user, stamp, updated=when, previous=previous
     )
     if new_body == current_body:
-        return 0
+        return
 
     try:
-        api_request("PATCH", pr_path, token, {"body": new_body})
+        api_request("PATCH", path, token, {"body": new_body})
     except urllib.error.HTTPError as e:
-        print(f"{CONSOLE_SCRIPT}: failed to update PR body ({e})", file=sys.stderr)
-    return 0
+        print(f"{CONSOLE_SCRIPT}: failed to update the description ({e})", file=sys.stderr)
 
 
 # --- settings files ----------------------------------------------------------
@@ -842,7 +1076,7 @@ def add_entries(groups, pairs):
 
 # --- verbose reporting -------------------------------------------------------
 
-# Wide enough that the longest label ("  github mcp pull requests ") still gets
+# Wide enough that the longest label ("  gh issue comment ") still gets
 # its three dots, so every line's value starts in the same column.
 _LABEL_WIDTH = 30
 

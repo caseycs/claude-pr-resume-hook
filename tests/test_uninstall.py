@@ -107,7 +107,7 @@ def test_removes_the_mcp_group_too(home, shim, monkeypatch, capsys):
     uninstall(monkeypatch)
 
     out = capsys.readouterr().out
-    assert "github mcp pull requests" in out
+    assert "github mcp tools" in out
     assert read(home / ".claude/settings.json") == {}
 
 
