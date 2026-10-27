@@ -1,6 +1,6 @@
 # claude-pr-resume-hook
 
-A [Claude Code](https://code.claude.com) `PostToolUse` hook. Every time Claude
+A [Claude Code](https://code.claude.com) hook, run after a tool call. Every time Claude
 opens, edits, comments on or reviews a pull request — or opens, edits or
 comments on an issue — in a session, through `gh pr …`/`gh issue …` or the
 GitHub MCP server, it makes sure the description ends with a block that lets you
@@ -99,6 +99,7 @@ already match:
 $ claude-pr-resume-hook install
 uv tool ...................... found  /Users/you/.local/bin/claude-pr-resume-hook
 settings ..................... /Users/you/.claude/settings.json
+event ........................ PostToolUse
   gh pr create ............... up to date
   gh pr edit ................. stale path, updating
                        was  python3 /old/checkout/append_resume_footer.py
@@ -109,6 +110,9 @@ settings ..................... /Users/you/.claude/settings.json
   gh issue edit .............. adding
   gh issue comment ........... adding
   github mcp tools ........... adding
+event ........................ PostToolUseFailure
+  gh pr create ............... adding
+  ...
 backup ....................... settings.json.bak
 result ....................... updated - restart Claude Code
 
@@ -175,7 +179,11 @@ put this under `hooks` in the settings file of your choice:
 ```
 
 Add the same entry for each other command — `gh pr comment*`,
-`gh issue create*`, `gh issue edit*`, `gh issue comment*` — to cover those too.
+`gh issue create*`, `gh issue edit*`, `gh issue comment*` — to cover those too,
+and register the whole group a second time under `hooks.PostToolUseFailure`,
+as `install` does: `PostToolUse` runs only when the tool call succeeded, so a
+description edit chained before a command that fails would otherwise leave the
+footer behind ([ADR 0012](docs/adr/0012-fire-on-failed-tool-calls-too.md)).
 
 `install` and `uninstall` recognise hand-written entries like these and
 reconcile them, so you can switch to the managed setup later without cleaning
@@ -230,6 +238,11 @@ The hook reads the Claude Code hook event JSON from stdin:
 The hook never blocks the tool call (`PostToolUse` can't block anyway) and
 logs failures to stderr rather than raising, so a broken token or a network
 hiccup never interrupts the session.
+
+It is registered under `PostToolUseFailure` as well as `PostToolUse`, and
+treats both events alike. Claude Code raises only the former for a Bash call
+that exited non-zero, and `gh pr edit 19 --body-file pr.md && npm test` has
+replaced the description long before the tests fail.
 
 The `if` filters keep Claude Code from spawning the hook for most Bash calls,
 but they are an optimisation rather than a guarantee: `if` matching **fails

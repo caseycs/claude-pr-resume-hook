@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Claude Code PostToolUse hook: after a session opens, edits, comments on or
-reviews a pull request, make sure the PR description ends with a line that lets
-you resume the Claude Code session that touched it.
+Claude Code hook, on PostToolUse and PostToolUseFailure: after a session opens,
+edits, comments on or reviews a pull request, make sure the PR description ends
+with a line that lets you resume the Claude Code session that touched it.
 
 Reads the Claude Code hook event JSON from stdin, and if it was one of those
 calls - `gh pr create|edit|comment|review`, or the GitHub MCP server's matching
@@ -212,6 +212,11 @@ HOOK_TARGETS = tuple(
     {"matcher": "Bash", "if": f"Bash({command}*)", "label": command}
     for command in MATCHED_COMMANDS
 ) + ({"matcher": MCP_MATCHER, "if": None, "label": "github mcp tools"},)
+# The tool events the targets are registered under. PostToolUse runs only
+# after a tool call that succeeded, and a `gh pr edit --body-file` chained
+# before a step that then fails has already replaced the description, footer
+# and all; PostToolUseFailure is what still runs then - see docs/adr/0012.
+HOOK_EVENTS = ("PostToolUse", "PostToolUseFailure")
 # A hook entry whose command mentions any of these belongs to us, and is
 # reconciled on install rather than duplicated.
 OURS_MARKERS = ("claude-pr-resume-hook", "claude_pr_resume_hook", "append_resume_footer")
@@ -985,8 +990,8 @@ def load_settings(path):
     return settings
 
 
-def post_tool_use_groups(settings, create=False):
-    """The PostToolUse matcher groups, without inventing keys unless asked."""
+def hook_groups(settings, event, create=False):
+    """The matcher groups under `hooks.<event>`, without inventing keys unless asked."""
     hooks = settings.get("hooks")
     if hooks is None:
         if not create:
@@ -995,13 +1000,13 @@ def post_tool_use_groups(settings, create=False):
     if not isinstance(hooks, dict):
         raise SystemExit(f"{CONSOLE_SCRIPT}: `hooks` in settings is not an object")
 
-    groups = hooks.get("PostToolUse")
+    groups = hooks.get(event)
     if groups is None:
         if not create:
             return []
-        groups = hooks.setdefault("PostToolUse", [])
+        groups = hooks.setdefault(event, [])
     if not isinstance(groups, list):
-        raise SystemExit(f"{CONSOLE_SCRIPT}: `hooks.PostToolUse` in settings is not an array")
+        raise SystemExit(f"{CONSOLE_SCRIPT}: `hooks.{event}` in settings is not an array")
     return groups
 
 
@@ -1034,8 +1039,9 @@ def prune_empty(settings):
     hooks = settings.get("hooks")
     if not isinstance(hooks, dict):
         return
-    if isinstance(hooks.get("PostToolUse"), list) and not hooks["PostToolUse"]:
-        del hooks["PostToolUse"]
+    for event in HOOK_EVENTS:
+        if isinstance(hooks.get(event), list) and not hooks[event]:
+            del hooks[event]
     if not hooks:
         del settings["hooks"]
 
@@ -1135,30 +1141,32 @@ def cmd_install(args):
     settings = load_settings(path)
     original = copy.deepcopy(settings)
 
-    groups = post_tool_use_groups(settings, create=True)
-    existing = take_our_entries(groups)
-    by_key = {
-        (matcher, entry.get("if")): entry
-        for matcher, entry in existing
-        if isinstance(entry, dict)
-    }
+    for event in HOOK_EVENTS:
+        report("event", event)
+        groups = hook_groups(settings, event, create=True)
+        existing = take_our_entries(groups)
+        by_key = {
+            (matcher, entry.get("if")): entry
+            for matcher, entry in existing
+            if isinstance(entry, dict)
+        }
 
-    for target in HOOK_TARGETS:
-        key = (target["matcher"], target["if"])
-        previous = by_key.pop(key, None)
-        if previous is None:
-            report(target["label"], "adding", indent=1)
-        elif previous.get("command") == shim:
-            report(target["label"], "up to date", indent=1)
-        else:
-            report(target["label"], "stale path, updating", indent=1)
-            detail("was", previous.get("command"))
-            detail("now", shim)
+        for target in HOOK_TARGETS:
+            key = (target["matcher"], target["if"])
+            previous = by_key.pop(key, None)
+            if previous is None:
+                report(target["label"], "adding", indent=1)
+            elif previous.get("command") == shim:
+                report(target["label"], "up to date", indent=1)
+            else:
+                report(target["label"], "stale path, updating", indent=1)
+                detail("was", previous.get("command"))
+                detail("now", shim)
 
-    if by_key:
-        report("legacy entries", f"{len(by_key)} removed", indent=1)
+        if by_key:
+            report("legacy entries", f"{len(by_key)} removed", indent=1)
 
-    add_entries(groups, desired_entries(shim))
+        add_entries(groups, desired_entries(shim))
     prune_empty(settings)
 
     if settings == original:
@@ -1185,19 +1193,22 @@ def cmd_uninstall(args):
     settings = load_settings(path)
     original = copy.deepcopy(settings)
 
-    groups = post_tool_use_groups(settings)
-    before_groups = len(groups)
-    removed = take_our_entries(groups)
-    for matcher, entry in removed:
-        filter_ = entry.get("if") if isinstance(entry, dict) else None
-        label = target_label(matcher, filter_)
-        if label is None:
-            # An entry from an older install, or a hand-edited one.
-            label = filter_[len("Bash(") : -len("*)")] if (filter_ or "").startswith("Bash(") else "entry"
-        report(label, "removed", indent=1)
-    dropped = before_groups - len(groups)
-    if dropped:
-        report("matcher groups", f"{dropped} emptied, dropped", indent=1)
+    for event in HOOK_EVENTS:
+        groups = hook_groups(settings, event)
+        before_groups = len(groups)
+        removed = take_our_entries(groups)
+        if removed:
+            report("event", event)
+        for matcher, entry in removed:
+            filter_ = entry.get("if") if isinstance(entry, dict) else None
+            label = target_label(matcher, filter_)
+            if label is None:
+                # An entry from an older install, or a hand-edited one.
+                label = filter_[len("Bash(") : -len("*)")] if (filter_ or "").startswith("Bash(") else "entry"
+            report(label, "removed", indent=1)
+        dropped = before_groups - len(groups)
+        if dropped:
+            report("matcher groups", f"{dropped} emptied, dropped", indent=1)
     prune_empty(settings)
 
     if settings == original:
@@ -1238,7 +1249,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog=CONSOLE_SCRIPT,
         description=(
-            "Claude Code PostToolUse hook that appends a resume-session footer to "
+            "Claude Code hook that appends a resume-session footer to "
             "the descriptions of PRs a session opens, edits, comments on or reviews. "
             "With no arguments, reads a hook event on stdin."
         ),

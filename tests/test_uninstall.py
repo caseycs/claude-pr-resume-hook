@@ -35,6 +35,20 @@ def test_install_then_uninstall_round_trips_to_nothing(home, shim, monkeypatch):
     assert read(path) == {"model": "opus"}
 
 
+def test_entries_for_failed_tool_calls_are_removed_too(home, shim, monkeypatch):
+    path = home / ".claude/settings.json"
+    seed(path, {"hooks": {"PostToolUseFailure": [
+        {"matcher": "Write", "hooks": [{"type": "command", "command": "echo fmt"}]},
+    ]}})
+    install(monkeypatch)
+
+    uninstall(monkeypatch)
+
+    assert read(path) == {"hooks": {"PostToolUseFailure": [
+        {"matcher": "Write", "hooks": [{"type": "command", "command": "echo fmt"}]},
+    ]}}
+
+
 def test_reports_each_removed_entry(home, shim, monkeypatch, capsys):
     install(monkeypatch)
     capsys.readouterr()

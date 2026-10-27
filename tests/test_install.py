@@ -165,6 +165,33 @@ def test_project_scopes_ignore_claude_config_dir(home, shim, monkeypatch, tmp_pa
     assert not config_dir.exists()
 
 
+def test_registers_the_same_entries_for_failed_tool_calls(home, shim, monkeypatch):
+    """PostToolUse runs only after a tool call that succeeded; a description edit
+    chained before a step that fails has already replaced the description, so
+    PostToolUseFailure carries the same entries (docs/adr/0012)."""
+    install(monkeypatch)
+
+    hooks = read(home / ".claude/settings.json")["hooks"]
+
+    assert list(hooks) == ["PostToolUse", "PostToolUseFailure"]
+    assert hooks["PostToolUseFailure"] == hooks["PostToolUse"]
+
+
+def test_an_install_from_before_the_failure_event_gains_it(home, shim, monkeypatch, capsys):
+    path = home / ".claude/settings.json"
+    seed(path, {"hooks": {"PostToolUse": [{"matcher": "Bash", "hooks": [
+        {"type": "command", "if": f"Bash({command}*)", "command": shim} for command in hook.MATCHED_COMMANDS
+    ] + [{"type": "command", "command": shim}]}]}})
+    # The MCP group is missing too, so the matcher of the trailing entry is wrong on purpose.
+
+    install(monkeypatch)
+
+    hooks = read(path)["hooks"]
+    assert hooks["PostToolUseFailure"] == hooks["PostToolUse"]
+    out = capsys.readouterr().out
+    assert "PostToolUseFailure" in out and "adding" in out
+
+
 # --- reconciliation ----------------------------------------------------------
 
 

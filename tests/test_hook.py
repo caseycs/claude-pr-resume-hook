@@ -561,6 +561,23 @@ def review(command, cwd="/work/tree"):
     }
 
 
+def test_a_failed_tool_call_still_refreshes_the_description(run_event, event, api, git):
+    """`gh pr edit --body-file pr.md && false` has replaced the description by
+    the time the call fails. Claude Code then raises PostToolUseFailure, whose
+    event carries the error instead of the output (docs/adr/0012)."""
+    failed = event(
+        hook_event_name="PostToolUseFailure",
+        tool_input={"command": "gh pr edit 123 --body-file pr.md >/dev/null && false"},
+        tool_response=None,
+        error="Command exited with code 1",
+    )
+
+    assert run_event(failed) == 0
+
+    assert api.pr_calls == [("GET", "/repos/o/r/pulls/123"), ("PATCH", "/repos/o/r/pulls/123")]
+    assert commands_in(api.patches[0]["body"]) == ["cd /work/tree; claude -r sess-abc"]
+
+
 def test_gh_pr_review_is_resolved_from_the_checkout(run_event, api, git):
     run_event(review("gh pr review 12 --approve"))
 

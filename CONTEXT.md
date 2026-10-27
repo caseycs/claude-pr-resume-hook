@@ -29,8 +29,8 @@ _Avoid_: conversation, chat, thread
 
 **Hook event**:
 The JSON document Claude Code writes to the hook's stdin, describing one
-completed tool call — the tool name, its input, its response, and the
-session's `cwd` and `session_id`.
+completed tool call — the tool name, its input, its response (or, on
+`PostToolUseFailure`, its error), and the session's `cwd` and `session_id`.
 _Avoid_: payload, message, request
 
 **Scope**:
@@ -47,7 +47,8 @@ _Avoid_: binary, wrapper, entry point
 One tool event the hook should fire on, as a matcher plus an optional filter —
 `gh pr create|edit|comment|review`, `gh issue create|edit|comment`, or the
 GitHub MCP server's PR and issue write tools (including comments and reviews). What
-`install` reconciles into settings, one entry per target.
+`install` reconciles into settings, one entry per target under each of
+`PostToolUse` and `PostToolUseFailure`.
 _Avoid_: trigger, rule, binding
 
 **Reconcile**:
